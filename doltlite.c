@@ -19217,6 +19217,9 @@ struct sqlite3 {
   VtabCtx *pVtabCtx;            /* Context for active vtab connect/create */
   VTable **aVTrans;             /* Virtual tables with open transactions */
   VTable *pDisconnect;          /* Disconnect these in next sqlite3_prepare() */
+#ifdef DOLTLITE_PROLLY
+  ExprList *pDoltliteHistoricalArgs;
+#endif
 #endif
   Hash aFunc;                   /* Hash table of connection functions */
   Hash aCollSeq;                /* All collating sequences */
@@ -22905,6 +22908,8 @@ SQLITE_PRIVATE int sqlite3BtreeIsDeferred(Btree*);
 const char *doltliteBtreeMissingWriteBranch(Btree*);
 int doltliteBtreeRunDeferredWork(sqlite3*);
 void doltliteBtreeRegistrationDone(sqlite3*);
+Module *doltliteHistoricalModuleRegister(sqlite3*,const char*);
+void doltliteHistoricalModulesReset(sqlite3*);
 #endif
 #if !defined(SQLITE_OMIT_BLOB_LITERAL)
 SQLITE_PRIVATE void *sqlite3HexToBlob(sqlite3*, const char *z, int n);
@@ -131621,6 +131626,11 @@ SQLITE_PRIVATE Table *sqlite3LocateTable(
     ** can be an eponymous virtual table. */
     if( (pParse->prepFlags & SQLITE_PREPARE_NO_VTAB)==0 && db->init.busy==0 ){
       Module *pMod = (Module*)sqlite3HashFind(&db->aModule, zName);
+#ifdef DOLTLITE_PROLLY
+      if( pMod==0 ){
+        pMod = doltliteHistoricalModuleRegister(db, zName);
+      }
+#endif
       if( pMod==0 && sqlite3_strnicmp(zName, "pragma_", 7)==0 ){
         pMod = sqlite3PragmaVtabRegister(db, zName);
       }
@@ -131675,6 +131685,10 @@ SQLITE_PRIVATE Table *sqlite3LocateTableItem(
   SrcItem *p
 ){
   const char *zDb;
+#if defined(DOLTLITE_PROLLY) && !defined(SQLITE_OMIT_VIRTUALTABLE)
+  ExprList *pSavedHistoricalArgs;
+  Table *pTab;
+#endif
   if( p->fg.fixedSchema ){
     int iDb = sqlite3SchemaToIndex(pParse->db, p->u4.pSchema);
     assert( iDb>=0 && iDb<pParse->db->nDb );
@@ -131683,7 +131697,16 @@ SQLITE_PRIVATE Table *sqlite3LocateTableItem(
     assert( !p->fg.isSubquery );
     zDb = p->u4.zDatabase;
   }
+#if defined(DOLTLITE_PROLLY) && !defined(SQLITE_OMIT_VIRTUALTABLE)
+  pSavedHistoricalArgs = pParse->db->pDoltliteHistoricalArgs;
+  pParse->db->pDoltliteHistoricalArgs =
+      p->fg.isTabFunc ? p->u1.pFuncArg : 0;
+  pTab = sqlite3LocateTable(pParse, flags, p->zName, zDb);
+  pParse->db->pDoltliteHistoricalArgs = pSavedHistoricalArgs;
+  return pTab;
+#else
   return sqlite3LocateTable(pParse, flags, p->zName, zDb);
+#endif
 }
 
 /*
@@ -288679,34 +288702,34 @@ void fe_frombytes(fe h, const unsigned char *s) {
 
     carry9 = (h9 + (int64_t) (1 << 24)) >> 25;
     h0 += carry9 * 19;
-    h9 -= carry9 << 25;
+    h9 -= carry9 * ((int64_t) 1 << 25);
     carry1 = (h1 + (int64_t) (1 << 24)) >> 25;
     h2 += carry1;
-    h1 -= carry1 << 25;
+    h1 -= carry1 * ((int64_t) 1 << 25);
     carry3 = (h3 + (int64_t) (1 << 24)) >> 25;
     h4 += carry3;
-    h3 -= carry3 << 25;
+    h3 -= carry3 * ((int64_t) 1 << 25);
     carry5 = (h5 + (int64_t) (1 << 24)) >> 25;
     h6 += carry5;
-    h5 -= carry5 << 25;
+    h5 -= carry5 * ((int64_t) 1 << 25);
     carry7 = (h7 + (int64_t) (1 << 24)) >> 25;
     h8 += carry7;
-    h7 -= carry7 << 25;
+    h7 -= carry7 * ((int64_t) 1 << 25);
     carry0 = (h0 + (int64_t) (1 << 25)) >> 26;
     h1 += carry0;
-    h0 -= carry0 << 26;
+    h0 -= carry0 * ((int64_t) 1 << 26);
     carry2 = (h2 + (int64_t) (1 << 25)) >> 26;
     h3 += carry2;
-    h2 -= carry2 << 26;
+    h2 -= carry2 * ((int64_t) 1 << 26);
     carry4 = (h4 + (int64_t) (1 << 25)) >> 26;
     h5 += carry4;
-    h4 -= carry4 << 26;
+    h4 -= carry4 * ((int64_t) 1 << 26);
     carry6 = (h6 + (int64_t) (1 << 25)) >> 26;
     h7 += carry6;
-    h6 -= carry6 << 26;
+    h6 -= carry6 * ((int64_t) 1 << 26);
     carry8 = (h8 + (int64_t) (1 << 25)) >> 26;
     h9 += carry8;
-    h8 -= carry8 << 26;
+    h8 -= carry8 * ((int64_t) 1 << 26);
 
     h[0] = (int32_t) h0;
     h[1] = (int32_t) h1;
@@ -289072,46 +289095,46 @@ void fe_mul(fe h, const fe f, const fe g) {
 
     carry0 = (h0 + (int64_t) (1 << 25)) >> 26;
     h1 += carry0;
-    h0 -= carry0 << 26;
+    h0 -= carry0 * ((int64_t) 1 << 26);
     carry4 = (h4 + (int64_t) (1 << 25)) >> 26;
     h5 += carry4;
-    h4 -= carry4 << 26;
+    h4 -= carry4 * ((int64_t) 1 << 26);
 
     carry1 = (h1 + (int64_t) (1 << 24)) >> 25;
     h2 += carry1;
-    h1 -= carry1 << 25;
+    h1 -= carry1 * ((int64_t) 1 << 25);
     carry5 = (h5 + (int64_t) (1 << 24)) >> 25;
     h6 += carry5;
-    h5 -= carry5 << 25;
+    h5 -= carry5 * ((int64_t) 1 << 25);
 
     carry2 = (h2 + (int64_t) (1 << 25)) >> 26;
     h3 += carry2;
-    h2 -= carry2 << 26;
+    h2 -= carry2 * ((int64_t) 1 << 26);
     carry6 = (h6 + (int64_t) (1 << 25)) >> 26;
     h7 += carry6;
-    h6 -= carry6 << 26;
+    h6 -= carry6 * ((int64_t) 1 << 26);
 
     carry3 = (h3 + (int64_t) (1 << 24)) >> 25;
     h4 += carry3;
-    h3 -= carry3 << 25;
+    h3 -= carry3 * ((int64_t) 1 << 25);
     carry7 = (h7 + (int64_t) (1 << 24)) >> 25;
     h8 += carry7;
-    h7 -= carry7 << 25;
+    h7 -= carry7 * ((int64_t) 1 << 25);
 
     carry4 = (h4 + (int64_t) (1 << 25)) >> 26;
     h5 += carry4;
-    h4 -= carry4 << 26;
+    h4 -= carry4 * ((int64_t) 1 << 26);
     carry8 = (h8 + (int64_t) (1 << 25)) >> 26;
     h9 += carry8;
-    h8 -= carry8 << 26;
+    h8 -= carry8 * ((int64_t) 1 << 26);
 
     carry9 = (h9 + (int64_t) (1 << 24)) >> 25;
     h0 += carry9 * 19;
-    h9 -= carry9 << 25;
+    h9 -= carry9 * ((int64_t) 1 << 25);
 
     carry0 = (h0 + (int64_t) (1 << 25)) >> 26;
     h1 += carry0;
-    h0 -= carry0 << 26;
+    h0 -= carry0 * ((int64_t) 1 << 26);
 
     h[0] = (int32_t) h0;
     h[1] = (int32_t) h1;
@@ -289169,17 +289192,17 @@ void fe_mul121666(fe h, fe f) {
     int64_t carry8;
     int64_t carry9;
 
-    carry9 = (h9 + (int64_t) (1<<24)) >> 25; h0 += carry9 * 19; h9 -= carry9 << 25;
-    carry1 = (h1 + (int64_t) (1<<24)) >> 25; h2 += carry1; h1 -= carry1 << 25;
-    carry3 = (h3 + (int64_t) (1<<24)) >> 25; h4 += carry3; h3 -= carry3 << 25;
-    carry5 = (h5 + (int64_t) (1<<24)) >> 25; h6 += carry5; h5 -= carry5 << 25;
-    carry7 = (h7 + (int64_t) (1<<24)) >> 25; h8 += carry7; h7 -= carry7 << 25;
+    carry9 = (h9 + (int64_t) (1<<24)) >> 25; h0 += carry9 * 19; h9 -= carry9 * ((int64_t) 1 << 25);
+    carry1 = (h1 + (int64_t) (1<<24)) >> 25; h2 += carry1; h1 -= carry1 * ((int64_t) 1 << 25);
+    carry3 = (h3 + (int64_t) (1<<24)) >> 25; h4 += carry3; h3 -= carry3 * ((int64_t) 1 << 25);
+    carry5 = (h5 + (int64_t) (1<<24)) >> 25; h6 += carry5; h5 -= carry5 * ((int64_t) 1 << 25);
+    carry7 = (h7 + (int64_t) (1<<24)) >> 25; h8 += carry7; h7 -= carry7 * ((int64_t) 1 << 25);
 
-    carry0 = (h0 + (int64_t) (1<<25)) >> 26; h1 += carry0; h0 -= carry0 << 26;
-    carry2 = (h2 + (int64_t) (1<<25)) >> 26; h3 += carry2; h2 -= carry2 << 26;
-    carry4 = (h4 + (int64_t) (1<<25)) >> 26; h5 += carry4; h4 -= carry4 << 26;
-    carry6 = (h6 + (int64_t) (1<<25)) >> 26; h7 += carry6; h6 -= carry6 << 26;
-    carry8 = (h8 + (int64_t) (1<<25)) >> 26; h9 += carry8; h8 -= carry8 << 26;
+    carry0 = (h0 + (int64_t) (1<<25)) >> 26; h1 += carry0; h0 -= carry0 * ((int64_t) 1 << 26);
+    carry2 = (h2 + (int64_t) (1<<25)) >> 26; h3 += carry2; h2 -= carry2 * ((int64_t) 1 << 26);
+    carry4 = (h4 + (int64_t) (1<<25)) >> 26; h5 += carry4; h4 -= carry4 * ((int64_t) 1 << 26);
+    carry6 = (h6 + (int64_t) (1<<25)) >> 26; h7 += carry6; h6 -= carry6 * ((int64_t) 1 << 26);
+    carry8 = (h8 + (int64_t) (1<<25)) >> 26; h9 += carry8; h8 -= carry8 * ((int64_t) 1 << 26);
 
     h[0] = (int32_t) h0;
     h[1] = (int32_t) h1;
@@ -289441,40 +289464,40 @@ void fe_sq(fe h, const fe f) {
     int64_t carry9;
     carry0 = (h0 + (int64_t) (1 << 25)) >> 26;
     h1 += carry0;
-    h0 -= carry0 << 26;
+    h0 -= carry0 * ((int64_t) 1 << 26);
     carry4 = (h4 + (int64_t) (1 << 25)) >> 26;
     h5 += carry4;
-    h4 -= carry4 << 26;
+    h4 -= carry4 * ((int64_t) 1 << 26);
     carry1 = (h1 + (int64_t) (1 << 24)) >> 25;
     h2 += carry1;
-    h1 -= carry1 << 25;
+    h1 -= carry1 * ((int64_t) 1 << 25);
     carry5 = (h5 + (int64_t) (1 << 24)) >> 25;
     h6 += carry5;
-    h5 -= carry5 << 25;
+    h5 -= carry5 * ((int64_t) 1 << 25);
     carry2 = (h2 + (int64_t) (1 << 25)) >> 26;
     h3 += carry2;
-    h2 -= carry2 << 26;
+    h2 -= carry2 * ((int64_t) 1 << 26);
     carry6 = (h6 + (int64_t) (1 << 25)) >> 26;
     h7 += carry6;
-    h6 -= carry6 << 26;
+    h6 -= carry6 * ((int64_t) 1 << 26);
     carry3 = (h3 + (int64_t) (1 << 24)) >> 25;
     h4 += carry3;
-    h3 -= carry3 << 25;
+    h3 -= carry3 * ((int64_t) 1 << 25);
     carry7 = (h7 + (int64_t) (1 << 24)) >> 25;
     h8 += carry7;
-    h7 -= carry7 << 25;
+    h7 -= carry7 * ((int64_t) 1 << 25);
     carry4 = (h4 + (int64_t) (1 << 25)) >> 26;
     h5 += carry4;
-    h4 -= carry4 << 26;
+    h4 -= carry4 * ((int64_t) 1 << 26);
     carry8 = (h8 + (int64_t) (1 << 25)) >> 26;
     h9 += carry8;
-    h8 -= carry8 << 26;
+    h8 -= carry8 * ((int64_t) 1 << 26);
     carry9 = (h9 + (int64_t) (1 << 24)) >> 25;
     h0 += carry9 * 19;
-    h9 -= carry9 << 25;
+    h9 -= carry9 * ((int64_t) 1 << 25);
     carry0 = (h0 + (int64_t) (1 << 25)) >> 26;
     h1 += carry0;
-    h0 -= carry0 << 26;
+    h0 -= carry0 * ((int64_t) 1 << 26);
     h[0] = (int32_t) h0;
     h[1] = (int32_t) h1;
     h[2] = (int32_t) h2;
@@ -289614,40 +289637,40 @@ void fe_sq2(fe h, const fe f) {
     h9 += h9;
     carry0 = (h0 + (int64_t) (1 << 25)) >> 26;
     h1 += carry0;
-    h0 -= carry0 << 26;
+    h0 -= carry0 * ((int64_t) 1 << 26);
     carry4 = (h4 + (int64_t) (1 << 25)) >> 26;
     h5 += carry4;
-    h4 -= carry4 << 26;
+    h4 -= carry4 * ((int64_t) 1 << 26);
     carry1 = (h1 + (int64_t) (1 << 24)) >> 25;
     h2 += carry1;
-    h1 -= carry1 << 25;
+    h1 -= carry1 * ((int64_t) 1 << 25);
     carry5 = (h5 + (int64_t) (1 << 24)) >> 25;
     h6 += carry5;
-    h5 -= carry5 << 25;
+    h5 -= carry5 * ((int64_t) 1 << 25);
     carry2 = (h2 + (int64_t) (1 << 25)) >> 26;
     h3 += carry2;
-    h2 -= carry2 << 26;
+    h2 -= carry2 * ((int64_t) 1 << 26);
     carry6 = (h6 + (int64_t) (1 << 25)) >> 26;
     h7 += carry6;
-    h6 -= carry6 << 26;
+    h6 -= carry6 * ((int64_t) 1 << 26);
     carry3 = (h3 + (int64_t) (1 << 24)) >> 25;
     h4 += carry3;
-    h3 -= carry3 << 25;
+    h3 -= carry3 * ((int64_t) 1 << 25);
     carry7 = (h7 + (int64_t) (1 << 24)) >> 25;
     h8 += carry7;
-    h7 -= carry7 << 25;
+    h7 -= carry7 * ((int64_t) 1 << 25);
     carry4 = (h4 + (int64_t) (1 << 25)) >> 26;
     h5 += carry4;
-    h4 -= carry4 << 26;
+    h4 -= carry4 * ((int64_t) 1 << 26);
     carry8 = (h8 + (int64_t) (1 << 25)) >> 26;
     h9 += carry8;
-    h8 -= carry8 << 26;
+    h8 -= carry8 * ((int64_t) 1 << 26);
     carry9 = (h9 + (int64_t) (1 << 24)) >> 25;
     h0 += carry9 * 19;
-    h9 -= carry9 << 25;
+    h9 -= carry9 * ((int64_t) 1 << 25);
     carry0 = (h0 + (int64_t) (1 << 25)) >> 26;
     h1 += carry0;
-    h0 -= carry0 << 26;
+    h0 -= carry0 * ((int64_t) 1 << 26);
     h[0] = (int32_t) h0;
     h[1] = (int32_t) h1;
     h[2] = (int32_t) h2;
@@ -289782,33 +289805,33 @@ void fe_tobytes(unsigned char *s, const fe h) {
     /* Goal: Output h-2^255 q, which is between 0 and 2^255-20. */
     carry0 = h0 >> 26;
     h1 += carry0;
-    h0 -= carry0 << 26;
+    h0 -= carry0 * ((int64_t) 1 << 26);
     carry1 = h1 >> 25;
     h2 += carry1;
-    h1 -= carry1 << 25;
+    h1 -= carry1 * ((int64_t) 1 << 25);
     carry2 = h2 >> 26;
     h3 += carry2;
-    h2 -= carry2 << 26;
+    h2 -= carry2 * ((int64_t) 1 << 26);
     carry3 = h3 >> 25;
     h4 += carry3;
-    h3 -= carry3 << 25;
+    h3 -= carry3 * ((int64_t) 1 << 25);
     carry4 = h4 >> 26;
     h5 += carry4;
-    h4 -= carry4 << 26;
+    h4 -= carry4 * ((int64_t) 1 << 26);
     carry5 = h5 >> 25;
     h6 += carry5;
-    h5 -= carry5 << 25;
+    h5 -= carry5 * ((int64_t) 1 << 25);
     carry6 = h6 >> 26;
     h7 += carry6;
-    h6 -= carry6 << 26;
+    h6 -= carry6 * ((int64_t) 1 << 26);
     carry7 = h7 >> 25;
     h8 += carry7;
-    h7 -= carry7 << 25;
+    h7 -= carry7 * ((int64_t) 1 << 25);
     carry8 = h8 >> 26;
     h9 += carry8;
-    h8 -= carry8 << 26;
+    h8 -= carry8 * ((int64_t) 1 << 26);
     carry9 = h9 >> 25;
-    h9 -= carry9 << 25;
+    h9 -= carry9 * ((int64_t) 1 << 25);
 
     /* h10 = carry9 */
     /*
@@ -289820,32 +289843,32 @@ void fe_tobytes(unsigned char *s, const fe h) {
     s[0] = (unsigned char) (h0 >> 0);
     s[1] = (unsigned char) (h0 >> 8);
     s[2] = (unsigned char) (h0 >> 16);
-    s[3] = (unsigned char) ((h0 >> 24) | (h1 << 2));
+    s[3] = (unsigned char) ((h0 >> 24) | ((uint32_t) h1 << 2));
     s[4] = (unsigned char) (h1 >> 6);
     s[5] = (unsigned char) (h1 >> 14);
-    s[6] = (unsigned char) ((h1 >> 22) | (h2 << 3));
+    s[6] = (unsigned char) ((h1 >> 22) | ((uint32_t) h2 << 3));
     s[7] = (unsigned char) (h2 >> 5);
     s[8] = (unsigned char) (h2 >> 13);
-    s[9] = (unsigned char) ((h2 >> 21) | (h3 << 5));
+    s[9] = (unsigned char) ((h2 >> 21) | ((uint32_t) h3 << 5));
     s[10] = (unsigned char) (h3 >> 3);
     s[11] = (unsigned char) (h3 >> 11);
-    s[12] = (unsigned char) ((h3 >> 19) | (h4 << 6));
+    s[12] = (unsigned char) ((h3 >> 19) | ((uint32_t) h4 << 6));
     s[13] = (unsigned char) (h4 >> 2);
     s[14] = (unsigned char) (h4 >> 10);
     s[15] = (unsigned char) (h4 >> 18);
     s[16] = (unsigned char) (h5 >> 0);
     s[17] = (unsigned char) (h5 >> 8);
     s[18] = (unsigned char) (h5 >> 16);
-    s[19] = (unsigned char) ((h5 >> 24) | (h6 << 1));
+    s[19] = (unsigned char) ((h5 >> 24) | ((uint32_t) h6 << 1));
     s[20] = (unsigned char) (h6 >> 7);
     s[21] = (unsigned char) (h6 >> 15);
-    s[22] = (unsigned char) ((h6 >> 23) | (h7 << 3));
+    s[22] = (unsigned char) ((h6 >> 23) | ((uint32_t) h7 << 3));
     s[23] = (unsigned char) (h7 >> 5);
     s[24] = (unsigned char) (h7 >> 13);
-    s[25] = (unsigned char) ((h7 >> 21) | (h8 << 4));
+    s[25] = (unsigned char) ((h7 >> 21) | ((uint32_t) h8 << 4));
     s[26] = (unsigned char) (h8 >> 4);
     s[27] = (unsigned char) (h8 >> 12);
-    s[28] = (unsigned char) ((h8 >> 20) | (h9 << 6));
+    s[28] = (unsigned char) ((h8 >> 20) | ((uint32_t) h9 << 6));
     s[29] = (unsigned char) (h9 >> 2);
     s[30] = (unsigned char) (h9 >> 10);
     s[31] = (unsigned char) (h9 >> 18);
@@ -291609,7 +291632,7 @@ static void cmov(ge_precomp *t, const ge_precomp *u, unsigned char b) {
 static void select(ge_precomp *t, int pos, signed char b) {
     ge_precomp minust;
     unsigned char bnegative = negative(b);
-    unsigned char babs = b - (((-bnegative) & b) << 1);
+    unsigned char babs = b - (((-bnegative) & b) * 2);
     fe_1(t->yplusx);
     fe_1(t->yminusx);
     fe_0(t->xy2d);
@@ -291657,7 +291680,7 @@ void ge_scalarmult_base(ge_p3 *h, const unsigned char *a) {
         e[i] += carry;
         carry = e[i] + 8;
         carry >>= 4;
-        e[i] -= carry << 4;
+        e[i] -= carry * ((int64_t) 1 << 4);
     }
 
     e[63] += carry;
@@ -291866,37 +291889,37 @@ void sc_reduce(unsigned char *s) {
     s18 = 0;
     carry6 = (s6 + (1 << 20)) >> 21;
     s7 += carry6;
-    s6 -= carry6 << 21;
+    s6 -= carry6 * ((int64_t) 1 << 21);
     carry8 = (s8 + (1 << 20)) >> 21;
     s9 += carry8;
-    s8 -= carry8 << 21;
+    s8 -= carry8 * ((int64_t) 1 << 21);
     carry10 = (s10 + (1 << 20)) >> 21;
     s11 += carry10;
-    s10 -= carry10 << 21;
+    s10 -= carry10 * ((int64_t) 1 << 21);
     carry12 = (s12 + (1 << 20)) >> 21;
     s13 += carry12;
-    s12 -= carry12 << 21;
+    s12 -= carry12 * ((int64_t) 1 << 21);
     carry14 = (s14 + (1 << 20)) >> 21;
     s15 += carry14;
-    s14 -= carry14 << 21;
+    s14 -= carry14 * ((int64_t) 1 << 21);
     carry16 = (s16 + (1 << 20)) >> 21;
     s17 += carry16;
-    s16 -= carry16 << 21;
+    s16 -= carry16 * ((int64_t) 1 << 21);
     carry7 = (s7 + (1 << 20)) >> 21;
     s8 += carry7;
-    s7 -= carry7 << 21;
+    s7 -= carry7 * ((int64_t) 1 << 21);
     carry9 = (s9 + (1 << 20)) >> 21;
     s10 += carry9;
-    s9 -= carry9 << 21;
+    s9 -= carry9 * ((int64_t) 1 << 21);
     carry11 = (s11 + (1 << 20)) >> 21;
     s12 += carry11;
-    s11 -= carry11 << 21;
+    s11 -= carry11 * ((int64_t) 1 << 21);
     carry13 = (s13 + (1 << 20)) >> 21;
     s14 += carry13;
-    s13 -= carry13 << 21;
+    s13 -= carry13 * ((int64_t) 1 << 21);
     carry15 = (s15 + (1 << 20)) >> 21;
     s16 += carry15;
-    s15 -= carry15 << 21;
+    s15 -= carry15 * ((int64_t) 1 << 21);
     s5 += s17 * 666643;
     s6 += s17 * 470296;
     s7 += s17 * 654183;
@@ -291941,40 +291964,40 @@ void sc_reduce(unsigned char *s) {
     s12 = 0;
     carry0 = (s0 + (1 << 20)) >> 21;
     s1 += carry0;
-    s0 -= carry0 << 21;
+    s0 -= carry0 * ((int64_t) 1 << 21);
     carry2 = (s2 + (1 << 20)) >> 21;
     s3 += carry2;
-    s2 -= carry2 << 21;
+    s2 -= carry2 * ((int64_t) 1 << 21);
     carry4 = (s4 + (1 << 20)) >> 21;
     s5 += carry4;
-    s4 -= carry4 << 21;
+    s4 -= carry4 * ((int64_t) 1 << 21);
     carry6 = (s6 + (1 << 20)) >> 21;
     s7 += carry6;
-    s6 -= carry6 << 21;
+    s6 -= carry6 * ((int64_t) 1 << 21);
     carry8 = (s8 + (1 << 20)) >> 21;
     s9 += carry8;
-    s8 -= carry8 << 21;
+    s8 -= carry8 * ((int64_t) 1 << 21);
     carry10 = (s10 + (1 << 20)) >> 21;
     s11 += carry10;
-    s10 -= carry10 << 21;
+    s10 -= carry10 * ((int64_t) 1 << 21);
     carry1 = (s1 + (1 << 20)) >> 21;
     s2 += carry1;
-    s1 -= carry1 << 21;
+    s1 -= carry1 * ((int64_t) 1 << 21);
     carry3 = (s3 + (1 << 20)) >> 21;
     s4 += carry3;
-    s3 -= carry3 << 21;
+    s3 -= carry3 * ((int64_t) 1 << 21);
     carry5 = (s5 + (1 << 20)) >> 21;
     s6 += carry5;
-    s5 -= carry5 << 21;
+    s5 -= carry5 * ((int64_t) 1 << 21);
     carry7 = (s7 + (1 << 20)) >> 21;
     s8 += carry7;
-    s7 -= carry7 << 21;
+    s7 -= carry7 * ((int64_t) 1 << 21);
     carry9 = (s9 + (1 << 20)) >> 21;
     s10 += carry9;
-    s9 -= carry9 << 21;
+    s9 -= carry9 * ((int64_t) 1 << 21);
     carry11 = (s11 + (1 << 20)) >> 21;
     s12 += carry11;
-    s11 -= carry11 << 21;
+    s11 -= carry11 * ((int64_t) 1 << 21);
     s0 += s12 * 666643;
     s1 += s12 * 470296;
     s2 += s12 * 654183;
@@ -291984,40 +292007,40 @@ void sc_reduce(unsigned char *s) {
     s12 = 0;
     carry0 = s0 >> 21;
     s1 += carry0;
-    s0 -= carry0 << 21;
+    s0 -= carry0 * ((int64_t) 1 << 21);
     carry1 = s1 >> 21;
     s2 += carry1;
-    s1 -= carry1 << 21;
+    s1 -= carry1 * ((int64_t) 1 << 21);
     carry2 = s2 >> 21;
     s3 += carry2;
-    s2 -= carry2 << 21;
+    s2 -= carry2 * ((int64_t) 1 << 21);
     carry3 = s3 >> 21;
     s4 += carry3;
-    s3 -= carry3 << 21;
+    s3 -= carry3 * ((int64_t) 1 << 21);
     carry4 = s4 >> 21;
     s5 += carry4;
-    s4 -= carry4 << 21;
+    s4 -= carry4 * ((int64_t) 1 << 21);
     carry5 = s5 >> 21;
     s6 += carry5;
-    s5 -= carry5 << 21;
+    s5 -= carry5 * ((int64_t) 1 << 21);
     carry6 = s6 >> 21;
     s7 += carry6;
-    s6 -= carry6 << 21;
+    s6 -= carry6 * ((int64_t) 1 << 21);
     carry7 = s7 >> 21;
     s8 += carry7;
-    s7 -= carry7 << 21;
+    s7 -= carry7 * ((int64_t) 1 << 21);
     carry8 = s8 >> 21;
     s9 += carry8;
-    s8 -= carry8 << 21;
+    s8 -= carry8 * ((int64_t) 1 << 21);
     carry9 = s9 >> 21;
     s10 += carry9;
-    s9 -= carry9 << 21;
+    s9 -= carry9 * ((int64_t) 1 << 21);
     carry10 = s10 >> 21;
     s11 += carry10;
-    s10 -= carry10 << 21;
+    s10 -= carry10 * ((int64_t) 1 << 21);
     carry11 = s11 >> 21;
     s12 += carry11;
-    s11 -= carry11 << 21;
+    s11 -= carry11 * ((int64_t) 1 << 21);
     s0 += s12 * 666643;
     s1 += s12 * 470296;
     s2 += s12 * 654183;
@@ -292027,67 +292050,67 @@ void sc_reduce(unsigned char *s) {
     s12 = 0;
     carry0 = s0 >> 21;
     s1 += carry0;
-    s0 -= carry0 << 21;
+    s0 -= carry0 * ((int64_t) 1 << 21);
     carry1 = s1 >> 21;
     s2 += carry1;
-    s1 -= carry1 << 21;
+    s1 -= carry1 * ((int64_t) 1 << 21);
     carry2 = s2 >> 21;
     s3 += carry2;
-    s2 -= carry2 << 21;
+    s2 -= carry2 * ((int64_t) 1 << 21);
     carry3 = s3 >> 21;
     s4 += carry3;
-    s3 -= carry3 << 21;
+    s3 -= carry3 * ((int64_t) 1 << 21);
     carry4 = s4 >> 21;
     s5 += carry4;
-    s4 -= carry4 << 21;
+    s4 -= carry4 * ((int64_t) 1 << 21);
     carry5 = s5 >> 21;
     s6 += carry5;
-    s5 -= carry5 << 21;
+    s5 -= carry5 * ((int64_t) 1 << 21);
     carry6 = s6 >> 21;
     s7 += carry6;
-    s6 -= carry6 << 21;
+    s6 -= carry6 * ((int64_t) 1 << 21);
     carry7 = s7 >> 21;
     s8 += carry7;
-    s7 -= carry7 << 21;
+    s7 -= carry7 * ((int64_t) 1 << 21);
     carry8 = s8 >> 21;
     s9 += carry8;
-    s8 -= carry8 << 21;
+    s8 -= carry8 * ((int64_t) 1 << 21);
     carry9 = s9 >> 21;
     s10 += carry9;
-    s9 -= carry9 << 21;
+    s9 -= carry9 * ((int64_t) 1 << 21);
     carry10 = s10 >> 21;
     s11 += carry10;
-    s10 -= carry10 << 21;
+    s10 -= carry10 * ((int64_t) 1 << 21);
 
     s[0] = (unsigned char) (s0 >> 0);
     s[1] = (unsigned char) (s0 >> 8);
-    s[2] = (unsigned char) ((s0 >> 16) | (s1 << 5));
+    s[2] = (unsigned char) ((s0 >> 16) | ((uint64_t) s1 << 5));
     s[3] = (unsigned char) (s1 >> 3);
     s[4] = (unsigned char) (s1 >> 11);
-    s[5] = (unsigned char) ((s1 >> 19) | (s2 << 2));
+    s[5] = (unsigned char) ((s1 >> 19) | ((uint64_t) s2 << 2));
     s[6] = (unsigned char) (s2 >> 6);
-    s[7] = (unsigned char) ((s2 >> 14) | (s3 << 7));
+    s[7] = (unsigned char) ((s2 >> 14) | ((uint64_t) s3 << 7));
     s[8] = (unsigned char) (s3 >> 1);
     s[9] = (unsigned char) (s3 >> 9);
-    s[10] = (unsigned char) ((s3 >> 17) | (s4 << 4));
+    s[10] = (unsigned char) ((s3 >> 17) | ((uint64_t) s4 << 4));
     s[11] = (unsigned char) (s4 >> 4);
     s[12] = (unsigned char) (s4 >> 12);
-    s[13] = (unsigned char) ((s4 >> 20) | (s5 << 1));
+    s[13] = (unsigned char) ((s4 >> 20) | ((uint64_t) s5 << 1));
     s[14] = (unsigned char) (s5 >> 7);
-    s[15] = (unsigned char) ((s5 >> 15) | (s6 << 6));
+    s[15] = (unsigned char) ((s5 >> 15) | ((uint64_t) s6 << 6));
     s[16] = (unsigned char) (s6 >> 2);
     s[17] = (unsigned char) (s6 >> 10);
-    s[18] = (unsigned char) ((s6 >> 18) | (s7 << 3));
+    s[18] = (unsigned char) ((s6 >> 18) | ((uint64_t) s7 << 3));
     s[19] = (unsigned char) (s7 >> 5);
     s[20] = (unsigned char) (s7 >> 13);
     s[21] = (unsigned char) (s8 >> 0);
     s[22] = (unsigned char) (s8 >> 8);
-    s[23] = (unsigned char) ((s8 >> 16) | (s9 << 5));
+    s[23] = (unsigned char) ((s8 >> 16) | ((uint64_t) s9 << 5));
     s[24] = (unsigned char) (s9 >> 3);
     s[25] = (unsigned char) (s9 >> 11);
-    s[26] = (unsigned char) ((s9 >> 19) | (s10 << 2));
+    s[26] = (unsigned char) ((s9 >> 19) | ((uint64_t) s10 << 2));
     s[27] = (unsigned char) (s10 >> 6);
-    s[28] = (unsigned char) ((s10 >> 14) | (s11 << 7));
+    s[28] = (unsigned char) ((s10 >> 14) | ((uint64_t) s11 << 7));
     s[29] = (unsigned char) (s11 >> 1);
     s[30] = (unsigned char) (s11 >> 9);
     s[31] = (unsigned char) (s11 >> 17);
@@ -292217,73 +292240,73 @@ void sc_muladd(unsigned char *s, const unsigned char *a, const unsigned char *b,
     s23 = 0;
     carry0 = (s0 + (1 << 20)) >> 21;
     s1 += carry0;
-    s0 -= carry0 << 21;
+    s0 -= carry0 * ((int64_t) 1 << 21);
     carry2 = (s2 + (1 << 20)) >> 21;
     s3 += carry2;
-    s2 -= carry2 << 21;
+    s2 -= carry2 * ((int64_t) 1 << 21);
     carry4 = (s4 + (1 << 20)) >> 21;
     s5 += carry4;
-    s4 -= carry4 << 21;
+    s4 -= carry4 * ((int64_t) 1 << 21);
     carry6 = (s6 + (1 << 20)) >> 21;
     s7 += carry6;
-    s6 -= carry6 << 21;
+    s6 -= carry6 * ((int64_t) 1 << 21);
     carry8 = (s8 + (1 << 20)) >> 21;
     s9 += carry8;
-    s8 -= carry8 << 21;
+    s8 -= carry8 * ((int64_t) 1 << 21);
     carry10 = (s10 + (1 << 20)) >> 21;
     s11 += carry10;
-    s10 -= carry10 << 21;
+    s10 -= carry10 * ((int64_t) 1 << 21);
     carry12 = (s12 + (1 << 20)) >> 21;
     s13 += carry12;
-    s12 -= carry12 << 21;
+    s12 -= carry12 * ((int64_t) 1 << 21);
     carry14 = (s14 + (1 << 20)) >> 21;
     s15 += carry14;
-    s14 -= carry14 << 21;
+    s14 -= carry14 * ((int64_t) 1 << 21);
     carry16 = (s16 + (1 << 20)) >> 21;
     s17 += carry16;
-    s16 -= carry16 << 21;
+    s16 -= carry16 * ((int64_t) 1 << 21);
     carry18 = (s18 + (1 << 20)) >> 21;
     s19 += carry18;
-    s18 -= carry18 << 21;
+    s18 -= carry18 * ((int64_t) 1 << 21);
     carry20 = (s20 + (1 << 20)) >> 21;
     s21 += carry20;
-    s20 -= carry20 << 21;
+    s20 -= carry20 * ((int64_t) 1 << 21);
     carry22 = (s22 + (1 << 20)) >> 21;
     s23 += carry22;
-    s22 -= carry22 << 21;
+    s22 -= carry22 * ((int64_t) 1 << 21);
     carry1 = (s1 + (1 << 20)) >> 21;
     s2 += carry1;
-    s1 -= carry1 << 21;
+    s1 -= carry1 * ((int64_t) 1 << 21);
     carry3 = (s3 + (1 << 20)) >> 21;
     s4 += carry3;
-    s3 -= carry3 << 21;
+    s3 -= carry3 * ((int64_t) 1 << 21);
     carry5 = (s5 + (1 << 20)) >> 21;
     s6 += carry5;
-    s5 -= carry5 << 21;
+    s5 -= carry5 * ((int64_t) 1 << 21);
     carry7 = (s7 + (1 << 20)) >> 21;
     s8 += carry7;
-    s7 -= carry7 << 21;
+    s7 -= carry7 * ((int64_t) 1 << 21);
     carry9 = (s9 + (1 << 20)) >> 21;
     s10 += carry9;
-    s9 -= carry9 << 21;
+    s9 -= carry9 * ((int64_t) 1 << 21);
     carry11 = (s11 + (1 << 20)) >> 21;
     s12 += carry11;
-    s11 -= carry11 << 21;
+    s11 -= carry11 * ((int64_t) 1 << 21);
     carry13 = (s13 + (1 << 20)) >> 21;
     s14 += carry13;
-    s13 -= carry13 << 21;
+    s13 -= carry13 * ((int64_t) 1 << 21);
     carry15 = (s15 + (1 << 20)) >> 21;
     s16 += carry15;
-    s15 -= carry15 << 21;
+    s15 -= carry15 * ((int64_t) 1 << 21);
     carry17 = (s17 + (1 << 20)) >> 21;
     s18 += carry17;
-    s17 -= carry17 << 21;
+    s17 -= carry17 * ((int64_t) 1 << 21);
     carry19 = (s19 + (1 << 20)) >> 21;
     s20 += carry19;
-    s19 -= carry19 << 21;
+    s19 -= carry19 * ((int64_t) 1 << 21);
     carry21 = (s21 + (1 << 20)) >> 21;
     s22 += carry21;
-    s21 -= carry21 << 21;
+    s21 -= carry21 * ((int64_t) 1 << 21);
     s11 += s23 * 666643;
     s12 += s23 * 470296;
     s13 += s23 * 654183;
@@ -292328,37 +292351,37 @@ void sc_muladd(unsigned char *s, const unsigned char *a, const unsigned char *b,
     s18 = 0;
     carry6 = (s6 + (1 << 20)) >> 21;
     s7 += carry6;
-    s6 -= carry6 << 21;
+    s6 -= carry6 * ((int64_t) 1 << 21);
     carry8 = (s8 + (1 << 20)) >> 21;
     s9 += carry8;
-    s8 -= carry8 << 21;
+    s8 -= carry8 * ((int64_t) 1 << 21);
     carry10 = (s10 + (1 << 20)) >> 21;
     s11 += carry10;
-    s10 -= carry10 << 21;
+    s10 -= carry10 * ((int64_t) 1 << 21);
     carry12 = (s12 + (1 << 20)) >> 21;
     s13 += carry12;
-    s12 -= carry12 << 21;
+    s12 -= carry12 * ((int64_t) 1 << 21);
     carry14 = (s14 + (1 << 20)) >> 21;
     s15 += carry14;
-    s14 -= carry14 << 21;
+    s14 -= carry14 * ((int64_t) 1 << 21);
     carry16 = (s16 + (1 << 20)) >> 21;
     s17 += carry16;
-    s16 -= carry16 << 21;
+    s16 -= carry16 * ((int64_t) 1 << 21);
     carry7 = (s7 + (1 << 20)) >> 21;
     s8 += carry7;
-    s7 -= carry7 << 21;
+    s7 -= carry7 * ((int64_t) 1 << 21);
     carry9 = (s9 + (1 << 20)) >> 21;
     s10 += carry9;
-    s9 -= carry9 << 21;
+    s9 -= carry9 * ((int64_t) 1 << 21);
     carry11 = (s11 + (1 << 20)) >> 21;
     s12 += carry11;
-    s11 -= carry11 << 21;
+    s11 -= carry11 * ((int64_t) 1 << 21);
     carry13 = (s13 + (1 << 20)) >> 21;
     s14 += carry13;
-    s13 -= carry13 << 21;
+    s13 -= carry13 * ((int64_t) 1 << 21);
     carry15 = (s15 + (1 << 20)) >> 21;
     s16 += carry15;
-    s15 -= carry15 << 21;
+    s15 -= carry15 * ((int64_t) 1 << 21);
     s5 += s17 * 666643;
     s6 += s17 * 470296;
     s7 += s17 * 654183;
@@ -292403,40 +292426,40 @@ void sc_muladd(unsigned char *s, const unsigned char *a, const unsigned char *b,
     s12 = 0;
     carry0 = (s0 + (1 << 20)) >> 21;
     s1 += carry0;
-    s0 -= carry0 << 21;
+    s0 -= carry0 * ((int64_t) 1 << 21);
     carry2 = (s2 + (1 << 20)) >> 21;
     s3 += carry2;
-    s2 -= carry2 << 21;
+    s2 -= carry2 * ((int64_t) 1 << 21);
     carry4 = (s4 + (1 << 20)) >> 21;
     s5 += carry4;
-    s4 -= carry4 << 21;
+    s4 -= carry4 * ((int64_t) 1 << 21);
     carry6 = (s6 + (1 << 20)) >> 21;
     s7 += carry6;
-    s6 -= carry6 << 21;
+    s6 -= carry6 * ((int64_t) 1 << 21);
     carry8 = (s8 + (1 << 20)) >> 21;
     s9 += carry8;
-    s8 -= carry8 << 21;
+    s8 -= carry8 * ((int64_t) 1 << 21);
     carry10 = (s10 + (1 << 20)) >> 21;
     s11 += carry10;
-    s10 -= carry10 << 21;
+    s10 -= carry10 * ((int64_t) 1 << 21);
     carry1 = (s1 + (1 << 20)) >> 21;
     s2 += carry1;
-    s1 -= carry1 << 21;
+    s1 -= carry1 * ((int64_t) 1 << 21);
     carry3 = (s3 + (1 << 20)) >> 21;
     s4 += carry3;
-    s3 -= carry3 << 21;
+    s3 -= carry3 * ((int64_t) 1 << 21);
     carry5 = (s5 + (1 << 20)) >> 21;
     s6 += carry5;
-    s5 -= carry5 << 21;
+    s5 -= carry5 * ((int64_t) 1 << 21);
     carry7 = (s7 + (1 << 20)) >> 21;
     s8 += carry7;
-    s7 -= carry7 << 21;
+    s7 -= carry7 * ((int64_t) 1 << 21);
     carry9 = (s9 + (1 << 20)) >> 21;
     s10 += carry9;
-    s9 -= carry9 << 21;
+    s9 -= carry9 * ((int64_t) 1 << 21);
     carry11 = (s11 + (1 << 20)) >> 21;
     s12 += carry11;
-    s11 -= carry11 << 21;
+    s11 -= carry11 * ((int64_t) 1 << 21);
     s0 += s12 * 666643;
     s1 += s12 * 470296;
     s2 += s12 * 654183;
@@ -292446,40 +292469,40 @@ void sc_muladd(unsigned char *s, const unsigned char *a, const unsigned char *b,
     s12 = 0;
     carry0 = s0 >> 21;
     s1 += carry0;
-    s0 -= carry0 << 21;
+    s0 -= carry0 * ((int64_t) 1 << 21);
     carry1 = s1 >> 21;
     s2 += carry1;
-    s1 -= carry1 << 21;
+    s1 -= carry1 * ((int64_t) 1 << 21);
     carry2 = s2 >> 21;
     s3 += carry2;
-    s2 -= carry2 << 21;
+    s2 -= carry2 * ((int64_t) 1 << 21);
     carry3 = s3 >> 21;
     s4 += carry3;
-    s3 -= carry3 << 21;
+    s3 -= carry3 * ((int64_t) 1 << 21);
     carry4 = s4 >> 21;
     s5 += carry4;
-    s4 -= carry4 << 21;
+    s4 -= carry4 * ((int64_t) 1 << 21);
     carry5 = s5 >> 21;
     s6 += carry5;
-    s5 -= carry5 << 21;
+    s5 -= carry5 * ((int64_t) 1 << 21);
     carry6 = s6 >> 21;
     s7 += carry6;
-    s6 -= carry6 << 21;
+    s6 -= carry6 * ((int64_t) 1 << 21);
     carry7 = s7 >> 21;
     s8 += carry7;
-    s7 -= carry7 << 21;
+    s7 -= carry7 * ((int64_t) 1 << 21);
     carry8 = s8 >> 21;
     s9 += carry8;
-    s8 -= carry8 << 21;
+    s8 -= carry8 * ((int64_t) 1 << 21);
     carry9 = s9 >> 21;
     s10 += carry9;
-    s9 -= carry9 << 21;
+    s9 -= carry9 * ((int64_t) 1 << 21);
     carry10 = s10 >> 21;
     s11 += carry10;
-    s10 -= carry10 << 21;
+    s10 -= carry10 * ((int64_t) 1 << 21);
     carry11 = s11 >> 21;
     s12 += carry11;
-    s11 -= carry11 << 21;
+    s11 -= carry11 * ((int64_t) 1 << 21);
     s0 += s12 * 666643;
     s1 += s12 * 470296;
     s2 += s12 * 654183;
@@ -292489,67 +292512,67 @@ void sc_muladd(unsigned char *s, const unsigned char *a, const unsigned char *b,
     s12 = 0;
     carry0 = s0 >> 21;
     s1 += carry0;
-    s0 -= carry0 << 21;
+    s0 -= carry0 * ((int64_t) 1 << 21);
     carry1 = s1 >> 21;
     s2 += carry1;
-    s1 -= carry1 << 21;
+    s1 -= carry1 * ((int64_t) 1 << 21);
     carry2 = s2 >> 21;
     s3 += carry2;
-    s2 -= carry2 << 21;
+    s2 -= carry2 * ((int64_t) 1 << 21);
     carry3 = s3 >> 21;
     s4 += carry3;
-    s3 -= carry3 << 21;
+    s3 -= carry3 * ((int64_t) 1 << 21);
     carry4 = s4 >> 21;
     s5 += carry4;
-    s4 -= carry4 << 21;
+    s4 -= carry4 * ((int64_t) 1 << 21);
     carry5 = s5 >> 21;
     s6 += carry5;
-    s5 -= carry5 << 21;
+    s5 -= carry5 * ((int64_t) 1 << 21);
     carry6 = s6 >> 21;
     s7 += carry6;
-    s6 -= carry6 << 21;
+    s6 -= carry6 * ((int64_t) 1 << 21);
     carry7 = s7 >> 21;
     s8 += carry7;
-    s7 -= carry7 << 21;
+    s7 -= carry7 * ((int64_t) 1 << 21);
     carry8 = s8 >> 21;
     s9 += carry8;
-    s8 -= carry8 << 21;
+    s8 -= carry8 * ((int64_t) 1 << 21);
     carry9 = s9 >> 21;
     s10 += carry9;
-    s9 -= carry9 << 21;
+    s9 -= carry9 * ((int64_t) 1 << 21);
     carry10 = s10 >> 21;
     s11 += carry10;
-    s10 -= carry10 << 21;
+    s10 -= carry10 * ((int64_t) 1 << 21);
 
     s[0] = (unsigned char) (s0 >> 0);
     s[1] = (unsigned char) (s0 >> 8);
-    s[2] = (unsigned char) ((s0 >> 16) | (s1 << 5));
+    s[2] = (unsigned char) ((s0 >> 16) | ((uint64_t) s1 << 5));
     s[3] = (unsigned char) (s1 >> 3);
     s[4] = (unsigned char) (s1 >> 11);
-    s[5] = (unsigned char) ((s1 >> 19) | (s2 << 2));
+    s[5] = (unsigned char) ((s1 >> 19) | ((uint64_t) s2 << 2));
     s[6] = (unsigned char) (s2 >> 6);
-    s[7] = (unsigned char) ((s2 >> 14) | (s3 << 7));
+    s[7] = (unsigned char) ((s2 >> 14) | ((uint64_t) s3 << 7));
     s[8] = (unsigned char) (s3 >> 1);
     s[9] = (unsigned char) (s3 >> 9);
-    s[10] = (unsigned char) ((s3 >> 17) | (s4 << 4));
+    s[10] = (unsigned char) ((s3 >> 17) | ((uint64_t) s4 << 4));
     s[11] = (unsigned char) (s4 >> 4);
     s[12] = (unsigned char) (s4 >> 12);
-    s[13] = (unsigned char) ((s4 >> 20) | (s5 << 1));
+    s[13] = (unsigned char) ((s4 >> 20) | ((uint64_t) s5 << 1));
     s[14] = (unsigned char) (s5 >> 7);
-    s[15] = (unsigned char) ((s5 >> 15) | (s6 << 6));
+    s[15] = (unsigned char) ((s5 >> 15) | ((uint64_t) s6 << 6));
     s[16] = (unsigned char) (s6 >> 2);
     s[17] = (unsigned char) (s6 >> 10);
-    s[18] = (unsigned char) ((s6 >> 18) | (s7 << 3));
+    s[18] = (unsigned char) ((s6 >> 18) | ((uint64_t) s7 << 3));
     s[19] = (unsigned char) (s7 >> 5);
     s[20] = (unsigned char) (s7 >> 13);
     s[21] = (unsigned char) (s8 >> 0);
     s[22] = (unsigned char) (s8 >> 8);
-    s[23] = (unsigned char) ((s8 >> 16) | (s9 << 5));
+    s[23] = (unsigned char) ((s8 >> 16) | ((uint64_t) s9 << 5));
     s[24] = (unsigned char) (s9 >> 3);
     s[25] = (unsigned char) (s9 >> 11);
-    s[26] = (unsigned char) ((s9 >> 19) | (s10 << 2));
+    s[26] = (unsigned char) ((s9 >> 19) | ((uint64_t) s10 << 2));
     s[27] = (unsigned char) (s10 >> 6);
-    s[28] = (unsigned char) ((s10 >> 14) | (s11 << 7));
+    s[28] = (unsigned char) ((s10 >> 14) | ((uint64_t) s11 << 7));
     s[29] = (unsigned char) (s11 >> 1);
     s[30] = (unsigned char) (s11 >> 9);
     s[31] = (unsigned char) (s11 >> 17);
@@ -510526,9 +510549,6 @@ int doltliteRegisterWorkspaceTables(sqlite3 *db);
 int doltliteRegisterBlameTables(sqlite3 *db);
 const sqlite3_module *doltliteDiffTableModule(void);
 const sqlite3_module *doltliteHistoryTableModule(void);
-int doltliteRegisterHistoricalTables(sqlite3 *db);
-int doltliteRegisterHistoricalTablesForCatalog(sqlite3 *db,
-                                                const ProllyHash *pCatHash);
 int doltliteRefreshConstraintViolationTables(sqlite3 *db);
 int doltliteSetTableSchemaHash(sqlite3 *db, Pgno iTable, const ProllyHash *pH);
 int doltliteUpdateSchemaHashes(sqlite3 *db);
@@ -510967,7 +510987,6 @@ int doltliteRegister(sqlite3 *db){
   if( (rc = doltliteTagRegister(db))!=SQLITE_OK ) return rc;
   if( (rc = doltliteConflictsRegister(db))!=SQLITE_OK ) return rc;
   if( (rc = doltliteGcRegister(db))!=SQLITE_OK ) return rc;
-  if( (rc = doltliteRegisterHistoricalTables(db))!=SQLITE_OK ) return rc;
   if( (rc = doltliteRegisterWorkspaceTables(db))!=SQLITE_OK ) return rc;
   if( (rc = doltliteAncestorRegister(db))!=SQLITE_OK ) return rc;
   if( (rc = doltliteRegisterBlameTables(db))!=SQLITE_OK ) return rc;
@@ -515280,11 +515299,7 @@ static void doltliteCommitFunc(
     sqlite3_result_error_code(context, rc);
     return;
   }
-  rc = doltliteRegisterHistoricalTablesForCatalog(db, &catalogHash);
-  if( rc!=SQLITE_OK ){
-    sqlite3_result_error_code(context, rc);
-    return;
-  }
+  doltliteHistoricalModulesReset(db);
   rc = doltliteRegisterBlameTables(db);
   if( rc!=SQLITE_OK ){
     sqlite3_result_error_code(context, rc);
@@ -525591,7 +525606,7 @@ static SQLITE_INLINE int doltliteVtabCommonRowid(
 }
 
 /* Allocates nByte (>= sizeof(DoltliteVtabCommon)); caller fills trailing fields. */
-int doltliteLoadHistoricalTableColumns(sqlite3*, const char*,
+int doltliteLoadHistoricalTableColumns(sqlite3*, const char*, const char*,
                                        DoltliteColInfo*, char**);
 
 static SQLITE_INLINE int doltliteVtabConnectTable(
@@ -525625,8 +525640,12 @@ static SQLITE_INLINE int doltliteVtabConnectTable(
   }
 
   if( historical ){
-    rc = doltliteLoadHistoricalTableColumns(db, v->zTableName,
+    rc = doltliteLoadHistoricalTableColumns(db, zMod, v->zTableName,
                                              &v->cols, pzErr);
+    if( rc==SQLITE_NOTFOUND && (!pzErr || !*pzErr) ){
+      if( pzErr ) *pzErr = sqlite3_mprintf("no such table: %s", zMod);
+      rc = pzErr && !*pzErr ? SQLITE_NOMEM : SQLITE_ERROR;
+    }
   }else{
     rc = doltliteLoadUserTableColumns(db, v->zTableName, &v->cols, pzErr);
   }
@@ -528850,8 +528869,7 @@ static int checkoutLoadAndApply(
 static int refreshBranchScopedTables(sqlite3 *db){
   int rc;
 
-  rc = doltliteRegisterHistoricalTables(db);
-  if( rc!=SQLITE_OK ) return rc;
+  doltliteHistoricalModulesReset(db);
   rc = doltliteRegisterWorkspaceTables(db);
   if( rc!=SQLITE_OK ) return rc;
   return doltliteRegisterBlameTables(db);
@@ -542223,8 +542241,8 @@ int doltliteGcVacuumInto(
     rc = gcWriteCompactedTo(cs, &marked, zPath, 0, &bTargetNonEmpty,
                             &pOutFile, &finalSize,
                             &aNewIndex, &nNewIndex, &nNewData);
-    sqlite3_free(zPath);
     if( bTargetNonEmpty ){
+      sqlite3_free(zPath);
       prollyHashSetFree(&marked);
       chunkStoreUnlock(cs);
       *pzPhase = "output file already exists";
@@ -542234,10 +542252,13 @@ int doltliteGcVacuumInto(
   prollyHashSetFree(&marked);
   chunkStoreUnlock(cs);
   if( rc!=SQLITE_OK ){
+    sqlite3_free(zPath);
     *pzPhase = "vacuum into write failed";
     return rc;
   }
+  /* The VFS keeps the open name until xClose; free it after. */
   sqlite3OsCloseFree(pOutFile);
+  sqlite3_free(zPath);
   sqlite3_free(aNewIndex);
   return SQLITE_OK;
 }
@@ -542983,6 +543004,7 @@ const sqlite3_module *doltliteHistoryTableModule(void){
 
 /* #include "doltlite_vtab_util.h" */
 /* #include "doltlite_commit.h" */
+/* #include "doltlite_ancestor.h" */
 /* #include "doltlite_internal.h" */
 
 /* #include <string.h> */
@@ -543030,13 +543052,6 @@ struct AtCursor {
   DoltlitePkRange pkRange;
 };
 
-typedef struct AtSeenTable AtSeenTable;
-struct AtSeenTable {
-  char **azName;
-  int nName;
-  int nAlloc;
-};
-
 static int atTakeChunkSourceError(
   ChunkStore *cs,
   char **pzErr,
@@ -543049,39 +543064,6 @@ static int atTakeChunkSourceError(
   else sqlite3_free(zErr);
   if( pRc && sourceRc!=SQLITE_OK ) *pRc = sourceRc;
   return 1;
-}
-
-static void atSeenTableClear(AtSeenTable *pSeen){
-  int i;
-  for(i=0; i<pSeen->nName; i++) sqlite3_free(pSeen->azName[i]);
-  sqlite3_free(pSeen->azName);
-  memset(pSeen, 0, sizeof(*pSeen));
-}
-
-static int atSeenTableHas(AtSeenTable *pSeen, const char *zName){
-  int i;
-  for(i=0; i<pSeen->nName; i++){
-    if( strcmp(pSeen->azName[i], zName)==0 ) return 1;
-  }
-  return 0;
-}
-
-static int atSeenTableAdd(AtSeenTable *pSeen, const char *zName){
-  char *zCopy;
-  if( atSeenTableHas(pSeen, zName) ) return SQLITE_OK;
-  if( pSeen->nName>=pSeen->nAlloc ){
-    int nNew = pSeen->nAlloc ? pSeen->nAlloc*2 : 16;
-    char **azNew;
-    if( nNew > 0x7fffffff/(int)sizeof(char*) ) return SQLITE_NOMEM;
-    azNew = sqlite3_realloc(pSeen->azName, nNew*(int)sizeof(char*));
-    if( !azNew ) return SQLITE_NOMEM;
-    pSeen->azName = azNew;
-    pSeen->nAlloc = nNew;
-  }
-  zCopy = sqlite3_mprintf("%s", zName);
-  if( !zCopy ) return SQLITE_NOMEM;
-  pSeen->azName[pSeen->nName++] = zCopy;
-  return SQLITE_OK;
 }
 
 static int atEnqueueReachableRoots(
@@ -543221,17 +543203,197 @@ int doltliteSideColsLoad(
   return SQLITE_OK;
 }
 
+static const char *atHistoricalLiteralArg(sqlite3 *db, int iArg){
+  ExprList *pArgs = db->pDoltliteHistoricalArgs;
+  Expr *pExpr;
+  if( !pArgs || iArg<0 || iArg>=pArgs->nExpr ) return 0;
+  pExpr = pArgs->a[iArg].pExpr;
+  return pExpr && pExpr->op==TK_STRING ? pExpr->u.zToken : 0;
+}
+
+static int atResolveSchemaRef(
+  sqlite3 *db,
+  const char *zRef,
+  int branchEffective,
+  int allowWorkspace,
+  ProllyHash *pCommit,
+  ProllyHash *pCatalog
+){
+  ChunkStore *cs = doltliteGetChunkStore(db);
+  DoltliteCommit commit;
+  int rc;
+
+  memset(&commit, 0, sizeof(commit));
+  memset(pCommit, 0, sizeof(*pCommit));
+  memset(pCatalog, 0, sizeof(*pCatalog));
+  if( allowWorkspace
+   && (doltliteRefIsWorking(zRef) || doltliteRefIsStaged(zRef)) ){
+    rc = doltliteResolveCatalogHashForRef(db, zRef, pCatalog);
+    if( rc==SQLITE_OK ) doltliteGetSessionHead(db, pCommit);
+    return rc;
+  }
+
+  rc = doltliteResolveRef(db, zRef, pCommit);
+  if( rc==SQLITE_OK ) rc = doltliteLoadCommit(db, pCommit, &commit);
+  if( rc==SQLITE_OK ) *pCatalog = commit.catalogHash;
+  doltliteCommitClear(&commit);
+  if( rc==SQLITE_OK && branchEffective && cs ){
+    ProllyHash branchCommit;
+    if( chunkStoreFindBranch(cs, zRef, &branchCommit)==SQLITE_OK
+     && !prollyHashIsEmpty(&branchCommit) ){
+      ProllyHash effective;
+      rc = doltliteResolveBranchEffectiveCatalog(
+          cs, zRef, &branchCommit, pCatalog, &effective);
+      if( rc==SQLITE_OK ) *pCatalog = effective;
+    }
+  }
+  return rc;
+}
+
+static int atResolveLiteralScope(
+  sqlite3 *db,
+  const char *zModule,
+  ProllyHash *aCommit,
+  ProllyHash *aCatalog,
+  int *pnRef,
+  int *pScoped,
+  char **pzErr
+){
+  ChunkStore *cs = doltliteGetChunkStore(db);
+  ExprList *pArgs = db->pDoltliteHistoricalArgs;
+  const char *azRef[2] = {0, 0};
+  char *zLeft = 0;
+  char *zRight = 0;
+  int branchEffective = 0;
+  int allowWorkspace = 0;
+  int nRef = 0;
+  int rangeType = DOLTLITE_RANGE_NONE;
+  int primary;
+  int i;
+  int rc = SQLITE_OK;
+
+  *pnRef = 0;
+  *pScoped = 0;
+  if( !pArgs || !zModule ) return SQLITE_OK;
+  if( sqlite3_strnicmp(zModule, "dolt_at_", 8)==0 ){
+    if( pArgs->nExpr!=1 ) return SQLITE_OK;
+    azRef[0] = atHistoricalLiteralArg(db, 0);
+    branchEffective = 1;
+    allowWorkspace = 1;
+    nRef = azRef[0] ? 1 : 0;
+  }else if( sqlite3_strnicmp(zModule, "dolt_history_", 13)==0 ){
+    if( pArgs->nExpr!=1 ) return SQLITE_OK;
+    azRef[0] = atHistoricalLiteralArg(db, 0);
+    nRef = azRef[0] ? 1 : 0;
+  }else if( sqlite3_strnicmp(zModule, "dolt_diff_", 10)==0 ){
+    allowWorkspace = 1;
+    if( pArgs->nExpr==2 ){
+      azRef[0] = atHistoricalLiteralArg(db, 1);
+      azRef[1] = atHistoricalLiteralArg(db, 0);
+      nRef = azRef[0] && azRef[1] ? 2 : 0;
+    }else if( pArgs->nExpr==1 ){
+      const char *zSpec = atHistoricalLiteralArg(db, 0);
+      if( zSpec ){
+        rc = doltliteSplitRevisionRange(
+            zSpec, &zLeft, &zRight, &rangeType);
+        if( rc==SQLITE_OK ){
+          azRef[0] = zRight;
+          azRef[1] = zLeft;
+          nRef = 2;
+        }else if( rc==SQLITE_NOMEM ){
+          goto done;
+        }else{
+          rc = SQLITE_OK;
+        }
+      }
+    }
+  }
+  if( nRef==0 ) goto done;
+
+  for(i=0; i<nRef; i++){
+    rc = atResolveSchemaRef(db, azRef[i], branchEffective, allowWorkspace,
+                            &aCommit[i], &aCatalog[i]);
+    if( rc!=SQLITE_OK ) goto resolve_failed;
+  }
+  if( rangeType==DOLTLITE_RANGE_THREE_DOT ){
+    DoltliteCommit ancestorCommit;
+    ProllyHash ancestor;
+    memset(&ancestorCommit, 0, sizeof(ancestorCommit));
+    rc = doltliteFindAncestor(db, &aCommit[1], &aCommit[0], &ancestor);
+    if( rc==SQLITE_OK ){
+      rc = doltliteLoadCommit(db, &ancestor, &ancestorCommit);
+    }
+    if( rc==SQLITE_OK ){
+      aCommit[1] = ancestor;
+      aCatalog[1] = ancestorCommit.catalogHash;
+    }
+    doltliteCommitClear(&ancestorCommit);
+    if( rc!=SQLITE_OK ) goto resolve_failed;
+  }
+  *pnRef = nRef;
+  *pScoped = 1;
+  goto done;
+
+resolve_failed:
+  primary = rc & 0xff;
+  if( atTakeChunkSourceError(cs, pzErr, &rc) ) goto done;
+  if( primary==SQLITE_ERROR || primary==SQLITE_NOTFOUND ) rc = SQLITE_OK;
+
+done:
+  sqlite3_free(zLeft);
+  sqlite3_free(zRight);
+  return rc;
+}
+
+static int atLoadSchemaColumns(
+  sqlite3 *db,
+  ChunkStore *cs,
+  ProllyCache *pCache,
+  const ProllyHash *pCatalog,
+  const char *zTableName,
+  DoltliteColInfo *pCols
+){
+  SchemaEntry entry;
+  int found = 0;
+  sqlite3 *tmp = 0;
+  int rc;
+
+  memset(&entry, 0, sizeof(entry));
+  if( prollyHashIsEmpty(pCatalog) ) return SQLITE_OK;
+  rc = loadSchemaEntryFromCatalog(db, cs, pCache, pCatalog,
+                                  zTableName, &entry, &found);
+  if( rc==SQLITE_OK && found && entry.zSql ){
+    rc = sqlite3_open(":memory:", &tmp);
+    if( rc==SQLITE_OK ) rc = sqlite3_exec(tmp, entry.zSql, 0, 0, 0);
+    if( rc==SQLITE_OK ) rc = doltliteGetColumnNames(tmp, zTableName, pCols);
+    if( rc==SQLITE_OK && pCols->nCol<=0 ){
+      doltliteFreeColInfo(pCols);
+      rc = SQLITE_NOTFOUND;
+    }
+  }
+  if( tmp ) sqlite3_close(tmp);
+  clearSchemaEntry(&entry);
+  return rc;
+}
+
 int doltliteLoadHistoricalTableColumns(
   sqlite3 *db,
+  const char *zModule,
   const char *zTableName,
   DoltliteColInfo *pCols,
   char **pzErr
 ){
   ChunkStore *cs = doltliteGetChunkStore(db);
   ProllyCache *pCache = doltliteGetCache(db);
-  int has, rc;
+  ProllyHash aCommit[2];
+  ProllyHash aCatalog[2];
   DoltliteCommitQueue q;
   ProllyHash cur;
+  int nRef = 0;
+  int scoped = 0;
+  int has;
+  int i;
+  int rc;
 
   memset(pCols, 0, sizeof(*pCols));
   pCols->iPkCol = -1;
@@ -543242,36 +543404,42 @@ int doltliteLoadHistoricalTableColumns(
     doltliteFreeColInfo(pCols);
   }
 
+  memset(aCommit, 0, sizeof(aCommit));
+  memset(aCatalog, 0, sizeof(aCatalog));
+  rc = atResolveLiteralScope(db, zModule, aCommit, aCatalog,
+                             &nRef, &scoped, pzErr);
+  for(i=0; rc==SQLITE_OK && i<nRef && pCols->nCol<=0; i++){
+    rc = atLoadSchemaColumns(
+        db, cs, pCache, &aCatalog[i], zTableName, pCols);
+    if( rc==SQLITE_NOTFOUND ){
+      if( !atTakeChunkSourceError(cs, pzErr, &rc) ) rc = SQLITE_OK;
+    }else if( rc!=SQLITE_OK ){
+      atTakeChunkSourceError(cs, pzErr, &rc);
+    }
+  }
+  if( rc!=SQLITE_OK || pCols->nCol>0 ) return rc;
+
   memset(&q, 0, sizeof(q));
   memset(&cur, 0, sizeof(cur));
   rc = doltliteCommitQueueInit(&q, &cur);
-  if( rc==SQLITE_OK ) rc = atEnqueueReachableRoots(db, &q);
+  if( scoped ){
+    for(i=0; i<nRef && rc==SQLITE_OK; i++){
+      rc = doltliteCommitQueueEnqueue(&q, &aCommit[i]);
+    }
+  }else if( rc==SQLITE_OK ){
+    rc = atEnqueueReachableRoots(db, &q);
+  }
   while( rc==SQLITE_OK && pCols->nCol<=0 ){
     DoltliteCommit commit;
-    SchemaEntry entry;
-    int found = 0;
-    sqlite3 *tmp = 0;
     memset(&commit, 0, sizeof(commit));
-    memset(&entry, 0, sizeof(entry));
     rc = doltliteCommitQueueNext(&q, &cur, &has);
     if( rc!=SQLITE_OK || !has ) break;
     rc = doltliteLoadCommit(db, &cur, &commit);
     if( rc==SQLITE_OK ) rc = doltliteCommitQueueEnqueueParents(&q, &commit);
     if( rc==SQLITE_OK ){
-      rc = loadSchemaEntryFromCatalog(db, cs, pCache, &commit.catalogHash,
-                                      zTableName, &entry, &found);
+      rc = atLoadSchemaColumns(
+          db, cs, pCache, &commit.catalogHash, zTableName, pCols);
     }
-    if( rc==SQLITE_OK && found && entry.zSql ){
-      rc = sqlite3_open(":memory:", &tmp);
-      if( rc==SQLITE_OK ) rc = sqlite3_exec(tmp, entry.zSql, 0, 0, 0);
-      if( rc==SQLITE_OK ) rc = doltliteGetColumnNames(tmp, zTableName, pCols);
-      if( rc==SQLITE_OK && pCols->nCol<=0 ){
-        doltliteFreeColInfo(pCols);
-        rc = SQLITE_NOTFOUND;
-      }
-    }
-    if( tmp ) sqlite3_close(tmp);
-    clearSchemaEntry(&entry);
     doltliteCommitClear(&commit);
     if( rc==SQLITE_NOTFOUND ){
       if( !atTakeChunkSourceError(cs, pzErr, &rc) ) rc = SQLITE_OK;
@@ -543281,14 +543449,7 @@ int doltliteLoadHistoricalTableColumns(
   }
   doltliteCommitQueueClear(&q);
 
-  if( rc==SQLITE_OK && pCols->nCol<=0 ){
-    if( pzErr ){
-      *pzErr = sqlite3_mprintf("table not found in reachable refs: %s",
-                               zTableName);
-      if( !*pzErr ) return SQLITE_NOMEM;
-    }
-    return SQLITE_ERROR;
-  }
+  if( rc==SQLITE_OK && pCols->nCol<=0 ) return SQLITE_NOTFOUND;
   return rc;
 }
 
@@ -543617,87 +543778,48 @@ static int atRegisterModule(
   return rc;
 }
 
-static int atRegisterOne(sqlite3 *db, AtSeenTable *pSeen, const char *zName){
+Module *doltliteHistoricalModuleRegister(sqlite3 *db, const char *zName){
+  const sqlite3_module *pModule;
+  const char *zPrefix;
+  int nPrefix;
   int rc;
-  if( !zName || atSeenTableHas(pSeen, zName) ) return SQLITE_OK;
-  rc = atRegisterModule(db, "dolt_at_", zName, &atModule);
-  if( rc==SQLITE_OK ){
-    rc = atRegisterModule(db, "dolt_diff_", zName,
-                          doltliteDiffTableModule());
+
+  if( db->nDb<=0 || !sqlite3BtreeIsDoltliteFormat(db->aDb[0].pBt) ){
+    return 0;
   }
-  if( rc==SQLITE_OK ){
-    rc = atRegisterModule(db, "dolt_history_", zName,
-                          doltliteHistoryTableModule());
+  if( sqlite3_strnicmp(zName, "dolt_at_", 8)==0 && zName[8] ){
+    zPrefix = "dolt_at_";
+    nPrefix = 8;
+    pModule = &atModule;
+  }else if( sqlite3_strnicmp(zName, "dolt_diff_", 10)==0 && zName[10] ){
+    zPrefix = "dolt_diff_";
+    nPrefix = 10;
+    pModule = doltliteDiffTableModule();
+  }else if( sqlite3_strnicmp(zName, "dolt_history_", 13)==0 && zName[13] ){
+    zPrefix = "dolt_history_";
+    nPrefix = 13;
+    pModule = doltliteHistoryTableModule();
+  }else{
+    return 0;
   }
-  if( rc!=SQLITE_OK ) return rc;
-  return atSeenTableAdd(pSeen, zName);
+
+  rc = atRegisterModule(db, zPrefix, zName+nPrefix, pModule);
+  if( rc!=SQLITE_OK ) return 0;
+  return (Module*)sqlite3HashFind(&db->aModule, zName);
 }
 
-static int atRegisterCatalogTables(
-  sqlite3 *db,
-  const ProllyHash *pCatHash,
-  AtSeenTable *pSeen
-){
-  struct TableEntry *aTables = 0;
-  int nTables = 0;
-  int i, rc;
-  if( prollyHashIsEmpty(pCatHash) ) return SQLITE_OK;
-  rc = doltliteLoadCatalog(db, pCatHash, &aTables, &nTables, 0);
-  if( rc!=SQLITE_OK ) return rc;
-  for(i=0; i<nTables && rc==SQLITE_OK; i++){
-    if( aTables[i].zName && aTables[i].iTable > 1 ){
-      rc = atRegisterOne(db, pSeen, aTables[i].zName);
+void doltliteHistoricalModulesReset(sqlite3 *db){
+  HashElem *pElem;
+  for(pElem=sqliteHashFirst(&db->aModule); pElem;
+      pElem=sqliteHashNext(pElem)){
+    Module *pModule = (Module*)sqliteHashData(pElem);
+    const char *zName = pModule->zName;
+    if( sqlite3_strnicmp(zName, "dolt_at_", 8)==0
+     || sqlite3_strnicmp(zName, "dolt_diff_", 10)==0
+     || sqlite3_strnicmp(zName, "dolt_history_", 13)==0 ){
+      sqlite3VtabEponymousTableClear(db, pModule);
     }
   }
-  doltliteFreeCatalog(aTables, nTables);
-  return rc;
-}
-
-int doltliteRegisterHistoricalTablesForCatalog(
-  sqlite3 *db,
-  const ProllyHash *pCatHash
-){
-  AtSeenTable seen;
-  int rc;
-  memset(&seen, 0, sizeof(seen));
-  rc = atRegisterCatalogTables(db, pCatHash, &seen);
-  atSeenTableClear(&seen);
-  return rc;
-}
-
-int doltliteRegisterHistoricalTables(sqlite3 *db){
-  ChunkStore *cs = doltliteGetChunkStore(db);
-  int has, rc;
-  DoltliteCommitQueue q;
-  ProllyHash cur;
-  AtSeenTable seen;
-
-  memset(&q, 0, sizeof(q));
-  memset(&cur, 0, sizeof(cur));
-  memset(&seen, 0, sizeof(seen));
-
-  if( !cs ) return SQLITE_OK;
-
-  rc = doltliteCommitQueueInit(&q, &cur);
-  if( rc!=SQLITE_OK ) return rc;
-  rc = atEnqueueReachableRoots(db, &q);
-
-  while( rc==SQLITE_OK ){
-    DoltliteCommit commit;
-    rc = doltliteCommitQueueNext(&q, &cur, &has);
-    if( rc!=SQLITE_OK || !has ) break;
-    rc = doltliteLoadCommit(db, &cur, &commit);
-    if( rc!=SQLITE_OK ) break;
-    rc = atRegisterCatalogTables(db, &commit.catalogHash, &seen);
-    if( rc==SQLITE_OK ){
-      rc = doltliteCommitQueueEnqueueParents(&q, &commit);
-    }
-    doltliteCommitClear(&commit);
-  }
-
-  doltliteCommitQueueClear(&q);
-  atSeenTableClear(&seen);
-  return rc;
 }
 
 #endif
@@ -550124,7 +550246,13 @@ static const char *zDocsAgentDefault =
   "- ATTACH works, but one transaction may write only one file-backed database.\n"
   "- Most SQLite SQL features remain available, including triggers, views,\n"
   "  FTS5, and R-Tree. For storage-coupled API and PRAGMA differences, see\n"
-  "  https://github.com/dolthub/doltlite#sqlite-compatibility.\n";
+  "  https://github.com/dolthub/doltlite/blob/master/doc/doltlite/sqlite-compatibility.md\n"
+  "  and pragmas.md alongside it.\n"
+  "- Full reference, one page per feature:\n"
+  "  https://github.com/dolthub/doltlite/tree/master/doc/doltlite\n"
+  "  Start with refs.md (revision syntax), transactions.md (what ROLLBACK\n"
+  "  undoes; dolt_commit ends the SQL transaction), and dolt-differences.md\n"
+  "  if you already know Dolt.\n";
 
 static int docsConnect(sqlite3 *db, void *pAux, int argc,
     const char *const*argv, sqlite3_vtab **ppVtab, char **pzErr){

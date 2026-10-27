@@ -175,7 +175,7 @@
 # define DOLTLITE_PROLLY 1
 #endif
 #ifndef DOLTLITE_VERSION
-# define DOLTLITE_VERSION "0.51.3"
+# define DOLTLITE_VERSION "0.51.4"
 #endif
 #ifndef DOLTLITE_ENABLE_REMOTES
 # define DOLTLITE_ENABLE_REMOTES 1
@@ -23009,6 +23009,7 @@ SQLITE_PRIVATE void sqlite3ErrorClear(sqlite3*);
 SQLITE_PRIVATE void sqlite3SystemError(sqlite3*,int);
 #ifdef DOLTLITE_PROLLY
 char *doltliteTakeChunkSourceError(sqlite3*,int*);
+char *doltliteTakeMissingChunkError(sqlite3*,int);
 int doltliteChunkSourceActive(sqlite3*);
 int doltliteOwnSchemaReload(sqlite3*);
 int doltliteInCommandTxn(sqlite3*);
@@ -24519,6 +24520,10 @@ struct ChunkStore {
   int checkpointActive;
   sqlite3_vfs *pOwnedVfs;
   DoltliteChunkSourceState *pChunkSource;
+  /* Last chunk a read found absent with no source to fetch it from. Probes
+  ** expect the miss, so it only explains an otherwise generic failure. */
+  u8 bMissingChunk;
+  ProllyHash missingChunk;
 
 };
 
@@ -24671,6 +24676,7 @@ int chunkStoreSourceSet(ChunkStore *cs, sqlite3 *db,
 void chunkStoreSourceCloseWriter(ChunkStore *cs);
 void chunkStoreSourceClose(ChunkStore *cs);
 char *chunkStoreSourceTakeError(ChunkStore *cs, int *pRc);
+char *chunkStoreTakeMissingChunkError(ChunkStore *cs);
 int chunkStoreOriginSourceEnabled(ChunkStore *cs);
 int chunkStoreSourceEnabled(ChunkStore *cs);
 
@@ -24811,6 +24817,15 @@ static inline int doltliteSocketSetTimeout(int fd, int timeoutMs) {
 static inline int doltliteNetInit(void) { return 0; }
 
 #endif
+
+static inline int doltliteSocketTimedOut(void) {
+#ifdef _WIN32
+  int err = WSAGetLastError();
+  return err == WSAETIMEDOUT || err == WSAEWOULDBLOCK;
+#else
+  return errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT;
+#endif
+}
 
 static inline int doltliteSocketSetBlocking(int fd, int blocking) {
 #ifdef _WIN32
@@ -89066,6 +89081,10 @@ struct ChunkStore {
   int checkpointActive;
   sqlite3_vfs *pOwnedVfs;
   DoltliteChunkSourceState *pChunkSource;
+  /* Last chunk a read found absent with no source to fetch it from. Probes
+  ** expect the miss, so it only explains an otherwise generic failure. */
+  u8 bMissingChunk;
+  ProllyHash missingChunk;
 
 };
 
@@ -89218,6 +89237,7 @@ int chunkStoreSourceSet(ChunkStore *cs, sqlite3 *db,
 void chunkStoreSourceCloseWriter(ChunkStore *cs);
 void chunkStoreSourceClose(ChunkStore *cs);
 char *chunkStoreSourceTakeError(ChunkStore *cs, int *pRc);
+char *chunkStoreTakeMissingChunkError(ChunkStore *cs);
 int chunkStoreOriginSourceEnabled(ChunkStore *cs);
 int chunkStoreSourceEnabled(ChunkStore *cs);
 
@@ -111653,6 +111673,14 @@ abort_due_to_error:
    && pOp->opcode!=OP_AggFinal
    && !doltliteChunkSourceActive(db) ){
     rc = SQLITE_CORRUPT_BKPT;
+  }
+  if( db->pParse==0 ){
+    char *zMiss = doltliteTakeMissingChunkError(
+        db, p->zErrMsg==0 ? rc : SQLITE_OK);
+    if( zMiss ){
+      sqlite3VdbeError(p, "%s", zMiss);
+      sqlite3_free(zMiss);
+    }
   }
 #endif
   assert( rc );
@@ -156271,6 +156299,7 @@ static int sqlite3LockAndPrepare(
   if( bTopLevel ){
     char *zOldSourceErr = doltliteTakeChunkSourceError(db, 0);
     sqlite3_free(zOldSourceErr);
+    sqlite3_free(doltliteTakeMissingChunkError(db, SQLITE_OK));
   }
   rc = doltliteBtreeRunDeferredWork(db);
   if( rc!=SQLITE_OK ) goto lock_and_prepare_out;
@@ -156302,6 +156331,12 @@ lock_and_prepare_out:
                          "%s", zSourceErr);
     }else if( sourceRc!=SQLITE_OK && !db->mallocFailed ){
       sqlite3Error(db, sourceRc);
+    }else if( rc!=SQLITE_OK && !db->mallocFailed ){
+      char *zMiss = doltliteTakeMissingChunkError(db, rc);
+      if( zMiss ){
+        sqlite3ErrorWithMsg(db, rc, "%s", zMiss);
+        sqlite3_free(zMiss);
+      }
     }
     sqlite3_free(zSourceErr);
   }
@@ -475799,6 +475834,8 @@ int mbedtls_x509_crt_get_ca_istrue(const mbedtls_x509_crt *crt)
 
 /* #include <stddef.h> */
 
+#define DOLTLITE_CREDS_SESSION "doltlite.creds"
+
 #define DOLTLITE_SEED_LEN   32
 #define DOLTLITE_PUBKEY_LEN 32
 #define DOLTLITE_SIG_LEN    64
@@ -475853,6 +475890,18 @@ int doltliteCredsList(const char *dir, char ***out, int *n);
 void doltliteCredsFreeList(char **list, int n);
 
 int doltliteCredsRemove(const char *dir, const char *kid);
+
+#define DOLTLITE_CREDS_ERROR     (-1)
+#define DOLTLITE_CREDS_NONE      0
+#define DOLTLITE_CREDS_SELECTED  1
+#define DOLTLITE_CREDS_ANONYMOUS 2
+
+int doltliteCredsConfigSet(const char*, const char*, const char*, int);
+char *doltliteCredsRemoteKey(const char*);
+int doltliteCredsLoadNamed(const char*, const char*, DoltliteCreds**);
+int doltliteCredsImport(const char*, DoltliteCreds**);
+int doltliteCredsResolve(const char*, const char*, const char*,
+                         DoltliteCreds**, char**, char**);
 
 int doltliteCredsLoadPubKey(const char *dir, const char *kid,
                             unsigned char pub[DOLTLITE_PUBKEY_LEN]);
@@ -475931,6 +475980,7 @@ static int doltliteParseDecimal(
 /* #include <dirent.h> */
 /* #include <fcntl.h> */
 /* #include <sys/stat.h> */
+#include <sys/file.h> /* amalgamator: keep */
 /* #include <unistd.h> */
 #endif
 
@@ -476441,21 +476491,35 @@ static char *decodeSegZ(const char *seg, size_t seglen) {
 
 int doltliteCredsFromJwk(const char *json, DoltliteCreds **out) {
   char *dstr = jsonFindString(json, "d");
-  unsigned char *seed = NULL;
-  size_t seedlen = 0;
+  char *xstr = jsonFindString(json, "x");
+  char *kty = jsonFindString(json, "kty");
+  char *crv = jsonFindString(json, "crv");
+  unsigned char *d = NULL, *x = NULL;
+  size_t nd = 0, nx = 0;
+  DoltliteCreds *c = NULL;
   int rc = 1;
 
-  if (!dstr) goto done;
-  if (doltliteBase64UrlDecode(dstr, &seed, &seedlen)) goto done;
-  if (seedlen != DOLTLITE_SEED_LEN) goto done;
-  rc = doltliteCredsFromSeed(seed, out);
+  *out = NULL;
+  if (!dstr || !xstr || !kty || !crv || strcmp(kty, "OKP") ||
+      strcmp(crv, "Ed25519")) goto done;
+  if (doltliteBase64UrlDecode(dstr, &d, &nd) ||
+      doltliteBase64UrlDecode(xstr, &x, &nx)) goto done;
+  if (nd != 32 || (nx != 32 && nx != 64)) goto done;
+  if (doltliteCredsFromSeed(nx == 64 ? x : d, &c)) goto done;
+  if (memcmp(c->pub, nx == 64 ? d : x, 32) ||
+      (nx == 64 && memcmp(c->pub, x + 32, 32))) goto done;
+  *out = c;
+  c = NULL;
+  rc = 0;
 
 done:
-  if (seed) {
-    memset(seed, 0, seedlen);
-    sqlite3_free(seed);
-  }
+  doltliteCredsFree(c);
+  if (d) { memset(d, 0, nd); sqlite3_free(d); }
+  if (x) { memset(x, 0, nx); sqlite3_free(x); }
   sqlite3_free(dstr);
+  sqlite3_free(xstr);
+  sqlite3_free(kty);
+  sqlite3_free(crv);
   return rc;
 }
 
@@ -476513,6 +476577,8 @@ static int mkdirp(const char *path) {
   sqlite3_free(tmp);
   return 0;
 }
+
+static char *credsResolveKid(const char*);
 
 static int credsKidValid(const char *kid) {
   const size_t nKid = (DOLTLITE_KID_RAW_LEN * 8 + 4) / 5;
@@ -476624,6 +476690,7 @@ int doltliteCredsLoad(const char *dir, const char *kid, DoltliteCreds **out) {
   long sz;
   int rc = 1;
 
+  *out = NULL;
   if (!dir) {
     owned = doltliteCredsDir();
     dir = owned;
@@ -476644,6 +476711,15 @@ int doltliteCredsLoad(const char *dir, const char *kid, DoltliteCreds **out) {
   json[sz] = '\0';
 
   rc = doltliteCredsFromJwk(json, out);
+  if (!rc) {
+    char *actual = doltliteCredsKid(*out);
+    if (!actual || strcmp(actual, kid)) {
+      doltliteCredsFree(*out);
+      *out = NULL;
+      rc = 1;
+    }
+    sqlite3_free(actual);
+  }
 
 done:
   if (f) fclose(f);
@@ -476674,7 +476750,12 @@ static int dirOpen(DirIter *it, const char *dir) {
   snprintf(pat, n, "%s\\*", dir);
   it->h = FindFirstFileA(pat, &it->fd);
   sqlite3_free(pat);
-  if (it->h == INVALID_HANDLE_VALUE) return 1;
+  if (it->h == INVALID_HANDLE_VALUE) {
+    DWORD err = GetLastError();
+    errno = err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND
+          ? ENOENT : EACCES;
+    return 1;
+  }
   it->first = 1;
   return 0;
 #else
@@ -476705,48 +476786,10 @@ static void dirClose(DirIter *it) {
 }
 
 int doltliteCredsLoadDefault(const char *dir, DoltliteCreds **out) {
-  char *owned = NULL;
-  DirIter it;
-  const char *name;
-  char *kid = NULL;
-  int count = 0, rc = 1;
-
-  if (!dir) {
-    owned = doltliteCredsDir();
-    dir = owned;
-  }
-  if (!dir) return 1;
-  if (dirOpen(&it, dir)) {
-    sqlite3_free(owned);
-    return 1;
-  }
-  while ((name = dirNext(&it)) != NULL) {
-    size_t n = strlen(name);
-    if (n > 4 && strcmp(name + n - 4, ".jwk") == 0) {
-      char *candidate = (char *)sqlite3_malloc(n - 4 + 1);
-      if (!candidate) continue;
-      memcpy(candidate, name, n - 4);
-      candidate[n - 4] = '\0';
-      if (!credsKidValid(candidate)) {
-        sqlite3_free(candidate);
-        continue;
-      }
-      count++;
-      if (count == 1) {
-        kid = candidate;
-      } else {
-        sqlite3_free(candidate);
-      }
-    }
-  }
-  dirClose(&it);
-
-  if (count == 1 && kid) {
-    rc = doltliteCredsLoad(dir, kid, out);
-  }
-  sqlite3_free(kid);
-  sqlite3_free(owned);
-  return rc;
+  char *error = NULL;
+  int rc = doltliteCredsResolve(dir, NULL, NULL, out, NULL, &error);
+  sqlite3_free(error);
+  return rc == DOLTLITE_CREDS_SELECTED ? 0 : 1;
 }
 
 int doltliteCredsList(const char *dir, char ***out, int *n) {
@@ -476765,8 +476808,9 @@ int doltliteCredsList(const char *dir, char ***out, int *n) {
   if (!dir) return 1;
 
   if (dirOpen(&it, dir)) {
+    int rc = errno == ENOENT ? 0 : 1;
     sqlite3_free(owned);
-    return 0;
+    return rc;
   }
   while ((name = dirNext(&it)) != NULL) {
     size_t ln = strlen(name);
@@ -476814,14 +476858,15 @@ void doltliteCredsFreeList(char **list, int n) {
 
 int doltliteCredsRemove(const char *dir, const char *kid) {
   char *owned = NULL;
-  char *path;
+  char *path, *canonical = credsResolveKid(kid);
   int rc;
   if (!dir) {
     owned = doltliteCredsDir();
     dir = owned;
   }
-  if (!dir) return 1;
-  path = credsFilePath(dir, kid);
+  if (!dir) { sqlite3_free(canonical); return 1; }
+  path = canonical ? credsFilePath(dir, canonical) : NULL;
+  sqlite3_free(canonical);
   if (!path) {
     sqlite3_free(owned);
     return 1;
@@ -477072,6 +477117,343 @@ done:
   return rc;
 }
 
+typedef struct CredsSetting CredsSetting;
+struct CredsSetting {
+  char *key;
+  char *value;
+  CredsSetting *next;
+};
+
+static void credsSettingsFree(CredsSetting *p) {
+  while (p) {
+    CredsSetting *next = p->next;
+    sqlite3_free(p->key);
+    sqlite3_free(p->value);
+    sqlite3_free(p);
+    p = next;
+  }
+}
+
+static int credsSettingsRead(const char *path, CredsSetting **out) {
+  FILE *f = fopen(path, "rb");
+  char line[160];
+  CredsSetting **tail = out;
+  *out = NULL;
+  if (!f) return errno == ENOENT ? 0 : 1;
+  while (fgets(line, sizeof(line), f)) {
+    char *eq = strchr(line, '=');
+    size_t n = strlen(line);
+    CredsSetting *p, *prev;
+    if (!n || line[n-1] != '\n' || !eq) goto bad;
+    line[n-1] = 0;
+    *eq++ = 0;
+    if (strcmp(line, "user.creds") &&
+        (strncmp(line, "remote.", 7) || !credsKidValid(line + 7))) goto bad;
+    if (strcmp(eq, "anonymous") && !credsKidValid(eq)) goto bad;
+    for (prev = *out; prev; prev = prev->next) {
+      if (!strcmp(prev->key, line)) goto bad;
+    }
+    p = sqlite3_malloc(sizeof(*p));
+    if (!p) goto bad;
+    memset(p, 0, sizeof(*p));
+    *tail = p;
+    tail = &p->next;
+    p->key = dlStrDup(line);
+    p->value = dlStrDup(eq);
+    if (!p->key || !p->value) goto bad;
+  }
+  if (ferror(f)) goto bad;
+  fclose(f);
+  return 0;
+bad:
+  fclose(f);
+  credsSettingsFree(*out);
+  *out = NULL;
+  return 1;
+}
+
+static char *credsConfigPath(const char *dir, const char *suffix) {
+  size_t n = strlen(dir) + strlen(suffix) + 9;
+  char *path = sqlite3_malloc(n);
+  if (path) snprintf(path, n, "%s/config%s", dir, suffix);
+  return path;
+}
+
+int doltliteCredsConfigSet(
+  const char *dir, const char *key, const char *value, int onlyIfMissing
+) {
+  char *owned = NULL, *path = NULL, *lockPath = NULL, *tmp = NULL;
+  CredsSetting *settings = NULL, *p;
+  FILE *f = NULL;
+  int rc = 1;
+#ifdef _WIN32
+  HANDLE lock = INVALID_HANDLE_VALUE;
+  OVERLAPPED ov = {0};
+#else
+  int lock = -1;
+#endif
+  if (strcmp(key, "user.creds") &&
+      (strncmp(key, "remote.", 7) || !credsKidValid(key+7))) return 1;
+  if (value && strcmp(value, "anonymous") && !credsKidValid(value)) return 1;
+  if (!dir) dir = owned = doltliteCredsDir();
+  if (!dir || mkdirp(dir)) goto done;
+  path = credsConfigPath(dir, "");
+  tmp = credsConfigPath(dir, ".tmp");
+  lockPath = credsConfigPath(dir, ".lock");
+  if (!path || !tmp || !lockPath) goto done;
+#ifdef _WIN32
+  lock = CreateFileA(lockPath, GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL, NULL);
+  if (lock == INVALID_HANDLE_VALUE ||
+      !LockFileEx(lock, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &ov)) goto done;
+#else
+  lock = open(lockPath, O_RDWR | O_CREAT, 0600);
+  if (lock < 0) goto done;
+  while (flock(lock, LOCK_EX)) {
+    if (errno != EINTR) goto done;
+  }
+#endif
+  if (credsSettingsRead(path, &settings)) goto done;
+  for (p = settings; p; p = p->next) {
+    if (!strcmp(p->key, key)) break;
+  }
+  if (p && onlyIfMissing) { rc = 0; goto done; }
+  if (!p) {
+    p = sqlite3_malloc(sizeof(*p));
+    if (!p) goto done;
+    memset(p, 0, sizeof(*p));
+    p->next = settings;
+    settings = p;
+    p->key = dlStrDup(key);
+    if (!p->key) goto done;
+  }
+  sqlite3_free(p->value);
+  p->value = value ? dlStrDup(value) : NULL;
+  if (value && !p->value) goto done;
+#ifdef _WIN32
+  f = fopen(tmp, "wb");
+#else
+  {
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) goto done;
+    fchmod(fd, 0600);
+    f = fdopen(fd, "wb");
+    if (!f) close(fd);
+  }
+#endif
+  if (!f) goto done;
+  for (p = settings; p; p = p->next) {
+    if (p->value && fprintf(f, "%s=%s\n", p->key, p->value) < 0) goto done;
+  }
+  if (fflush(f)) goto done;
+#ifndef _WIN32
+  if (fsync(fileno(f))) goto done;
+#endif
+  if (fclose(f)) { f = NULL; goto done; }
+  f = NULL;
+#ifdef _WIN32
+  if (!MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    goto done;
+#else
+  if (rename(tmp, path)) goto done;
+#endif
+  rc = 0;
+done:
+  if (f) fclose(f);
+#ifdef _WIN32
+  if (lock != INVALID_HANDLE_VALUE) {
+    UnlockFileEx(lock, 0, 1, 0, &ov);
+    CloseHandle(lock);
+  }
+#else
+  if (lock >= 0) close(lock);
+#endif
+  credsSettingsFree(settings);
+  sqlite3_free(owned);
+  sqlite3_free(path);
+  sqlite3_free(tmp);
+  sqlite3_free(lockPath);
+  return rc;
+}
+
+char *doltliteCredsRemoteKey(const char *url) {
+  char *canonical = dlStrDup(url);
+  char *end, *p, *key, *hash;
+  unsigned char digest[DOLTLITE_KID_RAW_LEN];
+  if (!canonical) return NULL;
+  end = strstr(canonical, "://");
+  if (!end) { sqlite3_free(canonical); return NULL; }
+  end = strchr(end + 3, '/');
+  if (!end) end = canonical + strlen(canonical);
+  for (p = canonical; p < end; p++) {
+    if (*p >= 'A' && *p <= 'Z') *p += 'a' - 'A';
+  }
+  if (end-canonical >= 4 && !strncmp(canonical, "https://", 8) &&
+      !memcmp(end-4, ":443", 4)) memmove(end-4, end, strlen(end)+1);
+  p = canonical + strlen(canonical);
+  while (p > canonical && p[-1] == '/') *--p = 0;
+  doltliteSha512_224((const unsigned char*)canonical, strlen(canonical), digest);
+  sqlite3_free(canonical);
+  hash = doltliteBase32Encode(digest, sizeof(digest));
+  if (!hash) return NULL;
+  key = sqlite3_malloc(strlen(hash)+8);
+  if (key) sprintf(key, "remote.%s", hash);
+  sqlite3_free(hash);
+  return key;
+}
+
+static char *credsResolveKid(const char *name) {
+  unsigned char pub[32], digest[DOLTLITE_KID_RAW_LEN];
+  uint32_t bits = 0;
+  int nbit = 0, n = 0;
+  size_t i;
+  if (!name) return NULL;
+  if (credsKidValid(name)) return dlStrDup(name);
+  if (strlen(name) != 52) return NULL;
+  for (i = 0; i < 52; i++) {
+    const char *p = strchr(B32_ALPHABET, name[i]);
+    if (!p) return NULL;
+    bits = (bits << 5) | (uint32_t)(p - B32_ALPHABET);
+    nbit += 5;
+    if (nbit >= 8) {
+      nbit -= 8;
+      if (n >= 32) return NULL;
+      pub[n++] = (unsigned char)(bits >> nbit);
+    }
+  }
+  if (n != 32 || (bits & 15)) return NULL;
+  doltliteSha512_224(pub, sizeof(pub), digest);
+  return doltliteBase32Encode(digest, sizeof(digest));
+}
+
+int doltliteCredsLoadNamed(const char *dir, const char *name, DoltliteCreds **out) {
+  char *kid = credsResolveKid(name);
+  int rc;
+  *out = NULL;
+  rc = kid ? doltliteCredsLoad(dir, kid, out) : 1;
+  sqlite3_free(kid);
+  return rc;
+}
+
+int doltliteCredsImport(const char *path, DoltliteCreds **out) {
+  char json[4097];
+  FILE *f = fopen(path, "rb");
+  size_t n;
+  int rc;
+  *out = NULL;
+  if (!f) return 1;
+  n = fread(json, 1, sizeof(json)-1, f);
+  rc = ferror(f) || !feof(f) || memchr(json, 0, n) != NULL;
+  fclose(f);
+  if (rc) return 1;
+  json[n] = 0;
+  rc = doltliteCredsFromJwk(json, out);
+  memset(json, 0, sizeof(json));
+  return rc;
+}
+
+int doltliteCredsResolve(
+  const char *dir, const char *override, const char *url,
+  DoltliteCreds **out, char **source, char **error
+) {
+  char *selected = NULL, *key = NULL;
+  CredsSetting *settings = NULL, *setting;
+  char **kids = NULL;
+  const char *why = NULL;
+  int n = 0, rc = DOLTLITE_CREDS_ERROR;
+  *out = NULL;
+  *error = NULL;
+  if (source) *source = NULL;
+  if (override && *override) {
+    selected = dlStrDup(override);
+    why = "connection";
+    if (!selected) goto oom;
+  } else {
+    const char *env = getenv("DOLTLITE_CREDS_KID");
+    if (env && *env) {
+      selected = dlStrDup(env);
+      why = "DOLTLITE_CREDS_KID";
+      if (!selected) goto oom;
+    }
+  }
+  if (!selected) {
+    char *ownedDir = dir ? NULL : doltliteCredsDir();
+    char *path = dir || ownedDir ? credsConfigPath(dir ? dir : ownedDir, "") : NULL;
+    int bad;
+    if (!path) { sqlite3_free(ownedDir); goto oom; }
+    bad = credsSettingsRead(path, &settings);
+    sqlite3_free(path);
+    sqlite3_free(ownedDir);
+    if (bad) goto badconfig;
+    if (url) {
+      key = doltliteCredsRemoteKey(url);
+      if (!key) goto oom;
+      for (setting = settings; setting; setting = setting->next) {
+        if (!strcmp(setting->key, key)) {
+          selected = dlStrDup(setting->value);
+          if (!selected) goto oom;
+          why = "remote";
+          break;
+        }
+      }
+    }
+    if (!selected) {
+      for (setting = settings; setting; setting = setting->next) {
+        if (!strcmp(setting->key, "user.creds")) {
+          selected = dlStrDup(setting->value);
+          if (!selected) goto oom;
+          why = "default";
+          break;
+        }
+      }
+    }
+  }
+  if (!selected) {
+    if (doltliteCredsList(dir, &kids, &n)) {
+      *error = dlStrDup("cannot read credential directory");
+      goto done;
+    }
+    if (n > 1) {
+      *error = dlStrDup("multiple credentials found; select one with dolt_creds_use()");
+      goto done;
+    }
+    if (!n) { rc = DOLTLITE_CREDS_NONE; goto done; }
+    selected = dlStrDup(kids[0]);
+    why = "single key";
+    if (!selected) goto oom;
+  }
+  if (!strcmp(selected, "anonymous")) {
+    rc = DOLTLITE_CREDS_ANONYMOUS;
+  } else if (doltliteCredsLoadNamed(dir, selected, out)) {
+    char message[256];
+    snprintf(message, sizeof(message),
+        "%s selected credential is missing, unreadable or invalid: %.52s; use dolt_creds_ls() and dolt_creds_use()",
+        why, selected);
+    *error = dlStrDup(message);
+  } else {
+    rc = DOLTLITE_CREDS_SELECTED;
+  }
+  if (source) {
+    *source = dlStrDup(why);
+    if (!*source) goto oom;
+  }
+  goto done;
+badconfig:
+  *error = dlStrDup("cannot read credential configuration");
+  goto done;
+oom:
+  sqlite3_free(*error);
+  *error = dlStrDup("out of memory resolving credentials");
+  rc = DOLTLITE_CREDS_ERROR;
+done:
+  credsSettingsFree(settings);
+  sqlite3_free(selected);
+  sqlite3_free(key);
+  doltliteCredsFreeList(kids, n);
+  return rc;
+}
+
 /************** End of doltlite_creds.c **************************************/
 #pragma pop_macro("JWT_CLOCK_SKEW_SECONDS")
 #pragma pop_macro("JWT_TTL_SECONDS")
@@ -477125,6 +477507,8 @@ int doltliteConnWriteAll(DoltliteConn *conn, const void *buf, int nbuf);
 int doltliteConnRead(DoltliteConn *conn, void *buf, int nbuf);
 
 int doltliteConnSetTimeout(DoltliteConn *conn, int timeoutMs);
+int doltliteConnSetIdleTimeout(DoltliteConn*, int idleMs, int initialMs);
+int doltliteConnTimeoutRemaining(DoltliteConn*);
 
 void doltliteConnClose(DoltliteConn *conn);
 
@@ -477160,6 +477544,8 @@ struct DoltliteConn {
   int useTls;
   int ownsConf;
   long long deadlineMs;
+  int idleTimeoutMs;
+  int timedOut;
   mbedtls_net_context net;
 
   mbedtls_ssl_context ssl;
@@ -477192,28 +477578,44 @@ static int connApplyDeadline(DoltliteConn *c) {
   long long remaining;
   if (c->deadlineMs == 0) return 0;
   remaining = c->deadlineMs - doltliteMonotonicMs();
-  if (remaining <= 0) return 1;
+  if (remaining <= 0) { c->timedOut = 1; return 1; }
   if (remaining > 0x7fffffff) remaining = 0x7fffffff;
   return doltliteSocketSetTimeout(c->net.fd, (int)remaining);
 }
 
+static int connIoResult(DoltliteConn *c, int n) {
+  if (n > 0 && c->idleTimeoutMs > 0) {
+    c->deadlineMs = doltliteMonotonicMs() + c->idleTimeoutMs;
+  } else if (n < 0 && doltliteSocketTimedOut()) {
+    c->timedOut = 1;
+  }
+  return n;
+}
+
 static int connSend(void *pCtx, const unsigned char *pBuf, size_t nBuf) {
-  int fd = ((mbedtls_net_context *)pCtx)->fd;
-  int flags = 0;
+  DoltliteConn *c = (DoltliteConn*)pCtx;
+  int flags = 0, n;
+  if (c->idleTimeoutMs && connApplyDeadline(c)) return MBEDTLS_ERR_SSL_TIMEOUT;
 #ifdef MSG_NOSIGNAL
   flags = MSG_NOSIGNAL;
 #endif
 #ifdef _WIN32
-  {
-    int n = send(fd, (const char *)pBuf, (int)nBuf, flags);
-    return n < 0 ? MBEDTLS_ERR_NET_SEND_FAILED : n;
-  }
+  n = send(c->net.fd, (const char *)pBuf, (int)nBuf, flags);
 #else
-  {
-    int n = (int)send(fd, pBuf, nBuf, flags);
-    return n < 0 ? MBEDTLS_ERR_NET_SEND_FAILED : n;
-  }
+  n = (int)send(c->net.fd, pBuf, nBuf, flags);
 #endif
+  connIoResult(c, n);
+  return n < 0 ? MBEDTLS_ERR_NET_SEND_FAILED : n;
+}
+
+static int connRecv(void *pCtx, unsigned char *pBuf, size_t nBuf) {
+  DoltliteConn *c = (DoltliteConn*)pCtx;
+  int n;
+  if (c->idleTimeoutMs && connApplyDeadline(c)) return MBEDTLS_ERR_SSL_TIMEOUT;
+  n = mbedtls_net_recv(&c->net, pBuf, nBuf);
+  if (n > 0) connIoResult(c, n);
+  else if (n < 0 && n != MBEDTLS_ERR_SSL_WANT_READ) connIoResult(c, n);
+  return n;
 }
 
 #ifdef _WIN32
@@ -477314,7 +477716,7 @@ DoltliteConn *doltliteConnOpenTimeout(
   if (mbedtls_ssl_setup(&c->ssl, &c->conf) != 0) goto fail_tls;
 
   if (mbedtls_ssl_set_hostname(&c->ssl, host) != 0) goto fail_tls;
-  mbedtls_ssl_set_bio(&c->ssl, &c->net, connSend, mbedtls_net_recv, NULL);
+  mbedtls_ssl_set_bio(&c->ssl, c, connSend, connRecv, NULL);
 
   do {
     if (connApplyDeadline(c) != 0) goto fail_tls;
@@ -477346,7 +477748,7 @@ int doltliteConnWriteAll(DoltliteConn *c, const void *buf, int nbuf) {
     if (c->useTls) {
       n = mbedtls_ssl_write(&c->ssl, p + off, (size_t)(nbuf - off));
     } else {
-      n = connSend(&c->net, p + off, (size_t)(nbuf - off));
+      n = connSend(c, p + off, (size_t)(nbuf - off));
     }
     if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
     if (n <= 0) return 1;
@@ -477360,7 +477762,7 @@ static int connReadOnce(DoltliteConn *c, void *buf, int nbuf) {
   if (c->useTls) {
     n = mbedtls_ssl_read(&c->ssl, (unsigned char *)buf, (size_t)nbuf);
   } else {
-    n = (int)mbedtls_net_recv(&c->net, (unsigned char *)buf, (size_t)nbuf);
+    n = connRecv(c, (unsigned char *)buf, (size_t)nbuf);
   }
   if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) return -2;
   if (c->useTls && n == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) return 0;
@@ -477385,9 +477787,23 @@ int doltliteConnReadNonblock(DoltliteConn *c, void *buf, int nbuf) {
 }
 
 int doltliteConnSetTimeout(DoltliteConn *c, int timeoutMs) {
+  c->idleTimeoutMs = 0;
+  c->timedOut = 0;
   c->deadlineMs = timeoutMs > 0 ? doltliteMonotonicMs() + timeoutMs : 0;
   if (timeoutMs <= 0) return doltliteSocketSetTimeout(c->net.fd, 0);
   return connApplyDeadline(c);
+}
+
+int doltliteConnSetIdleTimeout(DoltliteConn *c, int idleMs, int initialMs) {
+  int rc = doltliteConnSetTimeout(c, initialMs);
+  if (!rc) c->idleTimeoutMs = idleMs > 0 ? idleMs : 0;
+  return rc;
+}
+
+int doltliteConnTimeoutRemaining(DoltliteConn *c) {
+  long long remaining = c->deadlineMs - doltliteMonotonicMs();
+  if (c->timedOut || remaining <= 0) return 0;
+  return remaining > 0x7fffffff ? 0x7fffffff : (int)remaining;
 }
 
 void doltliteConnClose(DoltliteConn *c) {
@@ -477471,7 +477887,7 @@ DoltliteConn *doltliteConnServerAttach(DoltliteTlsServer *s, int clientFd) {
   mbedtls_ssl_init(&c->ssl);
 
   if (mbedtls_ssl_setup(&c->ssl, &s->conf) != 0) goto fail;
-  mbedtls_ssl_set_bio(&c->ssl, &c->net, connSend, mbedtls_net_recv, NULL);
+  mbedtls_ssl_set_bio(&c->ssl, c, connSend, connRecv, NULL);
   return c;
 
 fail:
@@ -498182,8 +498598,11 @@ int doltliteLoadLiveSchemaSql(sqlite3 *db, const char *zType,
                               const char *zDb,
                               const char *zName, const char *zTblName,
                               char **pzSql);
+#define OPEN_REVISION_MISSING_NONE  0
+#define OPEN_REVISION_MISSING_HASH  1   /* bare commit hash absent locally */
+#define OPEN_REVISION_MISSING_CHUNK 2   /* a ref reaches an absent commit */
 int doltliteResolveOpenRevision(
-  ChunkStore*, const char*, ProllyHash*, ProllyHash*, char**
+  ChunkStore*, const char*, ProllyHash*, ProllyHash*, char**, int*
 );
 int doltliteResolveTableName(sqlite3 *db, const char *zTable, Pgno *piTable);
 char *doltliteResolveTableNumber(sqlite3 *db, Pgno iTable);
@@ -499369,6 +499788,33 @@ static int btreeApplyChunkSourceError(
 }
 
 
+/* A revision reached a chunk the store lacks. CANTOPEN is the one open
+** failure whose message sqlite3_open keeps. */
+static int btreeOpenRevisionMissingError(
+  sqlite3 *db,
+  ChunkStore *cs,
+  const char *zRev,
+  int eMissing
+){
+  char *zDetail;
+  zDetail = chunkStoreSourceTakeError(cs, 0);
+  if( !zDetail ) zDetail = chunkStoreTakeMissingChunkError(cs);
+  cs->bMissingChunk = 0;
+  if( eMissing==OPEN_REVISION_MISSING_HASH && zDetail
+   && !chunkStoreSourceEnabled(cs) ){
+    sqlite3ErrorWithMsg(db, SQLITE_CANTOPEN,
+                        "branch or revision \"%s\" not found: %s",
+                        zRev, zDetail);
+  }else if( eMissing==OPEN_REVISION_MISSING_CHUNK && zDetail ){
+    sqlite3ErrorWithMsg(db, SQLITE_CANTOPEN, "%s", zDetail);
+  }else{
+    sqlite3ErrorWithMsg(db, SQLITE_CANTOPEN,
+                        "branch or revision \"%s\" not found", zRev);
+  }
+  sqlite3_free(zDetail);
+  return SQLITE_CANTOPEN;
+}
+
 /* Pending edits drain into the tree once they hold this much memory, not
 ** after a fixed number of rows: every drain builds and hashes the edited
 ** chunks, which a rolled-back statement throws away and a later drain or
@@ -500131,6 +500577,7 @@ static int prollyBtreeOpenImpl(
     ProllyHash branchCommit;
     ProllyHash revisionCatalog;
     u8 bDeferredOpen = 0;
+    int eMissing = OPEN_REVISION_MISSING_NONE;
     const char *zDef = zBranchFromPath ? zBranchFromPath :
       chunkStoreGetDefaultBranch(&pBt->store);
     if( !zDef ) zDef = "main";
@@ -500138,7 +500585,8 @@ static int prollyBtreeOpenImpl(
     memset(&revisionCatalog, 0, sizeof(revisionCatalog));
     if( zBranchFromPath && !pBt->store.openPending ){
       rc = doltliteResolveOpenRevision(&pBt->store, zDef, &branchCommit,
-                                       &revisionCatalog, &zResolvedBranch);
+                                       &revisionCatalog, &zResolvedBranch,
+                                       &eMissing);
 #if DOLTLITE_ENABLE_CHUNK_SOURCE
       if( rc==SQLITE_NOTFOUND && zResolvedBranch
        && !chunkStoreOriginSourceEnabled(&pBt->store) ){
@@ -500149,8 +500597,14 @@ static int prollyBtreeOpenImpl(
     }
     if( zBranchFromPath && rc!=SQLITE_OK ){
       int openRc;
-      rc = btreeApplyChunkSourceError(db, &pBt->store, rc);
-      if( rc==SQLITE_NOTFOUND ){
+      if( rc==SQLITE_NOTFOUND && eMissing!=OPEN_REVISION_MISSING_NONE ){
+        rc = btreeOpenRevisionMissingError(db, &pBt->store, zDef, eMissing);
+      }else{
+        rc = btreeApplyChunkSourceError(db, &pBt->store, rc);
+      }
+      if( rc==SQLITE_CANTOPEN ){
+        openRc = rc;
+      }else if( rc==SQLITE_NOTFOUND ){
         openRc = SQLITE_CANTOPEN;
         sqlite3ErrorWithMsg(db, openRc,
                             "branch or revision \"%s\" not found", zDef);
@@ -500231,8 +500685,13 @@ static int prollyBtreeOpenImpl(
           rc = SQLITE_OK;
         }
 #endif
-        if( rc!=SQLITE_OK ){
+        if( rc==SQLITE_NOTFOUND && p->isDetached ){
+          rc = btreeOpenRevisionMissingError(db, &pBt->store, zDef,
+                                             OPEN_REVISION_MISSING_CHUNK);
+        }else if( rc!=SQLITE_OK ){
           rc = btreeApplyChunkSourceError(db, &pBt->store, rc);
+        }
+        if( rc!=SQLITE_OK ){
           btreeClearBranchState(&state);
           pagerShimDestroy(pBt->pPagerShim);
           prollyCacheFree(&pBt->cache);
@@ -501993,6 +502452,10 @@ int doltliteBtreeRunDeferredWork(sqlite3 *db){
   if( rc!=SQLITE_OK ){
     char *zErr = doltliteTakeChunkSourceError(db, 0);
     if( zErr ){
+      sqlite3ErrorWithMsg(db, rc, "%s", zErr);
+      sqlite3_free(zErr);
+      sqlite3_free(doltliteTakeMissingChunkError(db, SQLITE_OK));
+    }else if( (zErr = doltliteTakeMissingChunkError(db, rc))!=0 ){
       sqlite3ErrorWithMsg(db, rc, "%s", zErr);
       sqlite3_free(zErr);
     }else{
@@ -504766,6 +505229,7 @@ int doltliteSwitchCatalog(sqlite3 *db, const ProllyHash *catHash){
   sqlite3_free(data);
   if( rc!=SQLITE_OK ) return rc;
 
+  pBtree->bMasterRootChangedTxn = 1;
   pBtree->aMeta[BTREE_SCHEMA_VERSION]++;
   btreeBumpLocalDataVersion(pBtree);
 
@@ -512203,7 +512667,7 @@ int doltliteBtreeHydrateDeferred(Btree *p){
     ProllyHash commit;
     memset(&commit, 0, sizeof(commit));
     rc = doltliteResolveOpenRevision(cs, p->zBranch, &commit,
-                                     &loadedCatHash, &zPrepared);
+                                     &loadedCatHash, &zPrepared, 0);
     if( rc!=SQLITE_OK ){
       sqlite3_free(zPrepared);
       return rc==SQLITE_NOTFOUND ? SQLITE_CANTOPEN : rc;
@@ -518581,6 +519045,8 @@ int doltlitePushAs(ChunkStore *pLocal, DoltliteRemote *pRemote,
 
 int doltlitePushTag(ChunkStore *pLocal, DoltliteRemote *pRemote,
                     const char *zTag);
+/* Delete tag zTag from the remote; SQLITE_NOTFOUND if it has none. */
+int doltliteDeleteRemoteTag(DoltliteRemote *pRemote, const char *zTag);
 
 /* Allow only the declared branch or tag update; every other ref must match. */
 /* Optional *pbMissing: set when the update failed because the store lacks
@@ -518629,6 +519095,7 @@ DoltliteRemote *doltliteRemoteOpenReadOnly(sqlite3_vfs *pVfs,
                                            const char *zUrl);
 
 DoltliteRemote *doltliteHttpRemoteOpen(const char *zUrl);
+void doltliteHttpRemoteSetConnection(DoltliteRemote*, sqlite3*);
 
 int doltliteHttpParseResponseForTest(const u8 *pRaw, int nRaw, int nHash);
 
@@ -518642,6 +519109,12 @@ static int csHasOrigin(ChunkStore *cs){
   const char *zUrl = 0;
   return chunkStoreFindRemote(cs, "origin", &zUrl)==SQLITE_OK
       && zUrl && zUrl[0];
+}
+
+static int csNoteMissingChunk(ChunkStore *cs, const ProllyHash *pHash){
+  cs->bMissingChunk = 1;
+  memcpy(&cs->missingChunk, pHash, sizeof(*pHash));
+  return SQLITE_NOTFOUND;
 }
 
 #if DOLTLITE_ENABLE_CHUNK_SOURCE
@@ -518738,6 +519211,8 @@ static int SQLITE_CALLBACK csOriginGetMany(
       p->pOriginRemote = pRemote;
     }
   }
+
+  doltliteHttpRemoteSetConnection(pRemote, p->db);
 
   for(offset=0; offset<nHash; offset += CHUNK_READ_BATCH_MAX){
     ProllyHash aBatch[CHUNK_READ_BATCH_MAX];
@@ -519127,7 +519602,7 @@ int chunkStoreSourceGet(
   int rc;
   if( !p ){
     if( csHasOrigin(cs) ) return csSourceSetModeError(cs, pHash);
-    return SQLITE_NOTFOUND;
+    return csNoteMissingChunk(cs, pHash);
   }
   csSourceClearError(p);
   rc = csSourceCacheGet(p, pHash, ppData, pnData);
@@ -519150,7 +519625,7 @@ int chunkStoreSourceGet(
     if( csHasOrigin(cs) && !p->originEnabled ){
       return csSourceSetModeError(cs, pHash);
     }
-    return SQLITE_NOTFOUND;
+    return csNoteMissingChunk(cs, pHash);
   }
   sourceRc = pSource->xGet(pSource->pCtx, pHash->data, &pData, &nData);
   if( sourceRc==DOLTLITE_SOURCE_NOTFOUND ){
@@ -519520,6 +519995,40 @@ SQLITE_API int SQLITE_APICALL doltlite_set_chunk_source(
   return rc;
 }
 
+/* Remotes are local configuration: the installed refs replace the graph's
+** refs but keep any remote the blob does not name. */
+static int csInstallRefsKeepingRemotes(
+  ChunkStore *cs,
+  const u8 *pRefs,
+  int nRefs
+){
+  char **azKeep = 0;
+  int nKeep = cs->refs.nRemotes;
+  int bAdded = 0;
+  int rc = SQLITE_OK;
+  int i;
+  if( nKeep>0 ){
+    azKeep = (char**)sqlite3_malloc64(sizeof(char*) * 2 * (u64)nKeep);
+    if( !azKeep ) return SQLITE_NOMEM;
+    memset(azKeep, 0, sizeof(char*) * 2 * (size_t)nKeep);
+    for(i=0; rc==SQLITE_OK && i<nKeep; i++){
+      azKeep[i*2] = sqlite3_mprintf("%s", cs->refs.aRemotes[i].zName);
+      azKeep[i*2+1] = sqlite3_mprintf("%s", cs->refs.aRemotes[i].zUrl);
+      if( !azKeep[i*2] || !azKeep[i*2+1] ) rc = SQLITE_NOMEM;
+    }
+  }
+  if( rc==SQLITE_OK ) rc = chunkStoreInstallRefsBlob(cs, pRefs, nRefs);
+  for(i=0; rc==SQLITE_OK && i<nKeep; i++){
+    if( chunkStoreFindRemote(cs, azKeep[i*2], 0)==SQLITE_OK ) continue;
+    rc = chunkStoreAddRemote(cs, azKeep[i*2], azKeep[i*2+1]);
+    bAdded = 1;
+  }
+  if( rc==SQLITE_OK && bAdded ) rc = chunkStoreSerializeRefs(cs);
+  for(i=0; i<nKeep*2 && azKeep; i++) sqlite3_free(azKeep[i]);
+  sqlite3_free(azKeep);
+  return rc;
+}
+
 SQLITE_API int SQLITE_APICALL doltlite_init_lazy(
   sqlite3 *db,
   const void *pRefs,
@@ -519562,7 +520071,7 @@ SQLITE_API int SQLITE_APICALL doltlite_init_lazy(
       rc = chunkStoreForceRefresh(cs);
     }
     if( rc==SQLITE_OK ){
-      rc = chunkStoreInstallRefsBlob(cs, (const u8*)pRefs, nRefs);
+      rc = csInstallRefsKeepingRemotes(cs, (const u8*)pRefs, nRefs);
     }
     if( rc==SQLITE_OK ){
       rc = chunkStoreCommit(cs);
@@ -519653,7 +520162,7 @@ int chunkStoreSourceGet(ChunkStore *cs, const ProllyHash *pHash,
                         u8 **ppData, int *pnData){
   *ppData = 0;
   *pnData = 0;
-  if( !csHasOrigin(cs) ) return SQLITE_NOTFOUND;
+  if( !csHasOrigin(cs) ) return csNoteMissingChunk(cs, pHash);
   if( chunkStoreOriginSourceEnabled(cs) ){
     return csDisabledSetHashError(
         cs, pHash, "DoltLite chunk source support is disabled for",
@@ -519797,6 +520306,31 @@ SQLITE_API int SQLITE_APICALL doltlite_init_lazy(
 }
 
 #endif
+
+char *chunkStoreTakeMissingChunkError(ChunkStore *cs){
+  char zHex[PROLLY_HASH_SIZE*2 + 1];
+  if( !cs->bMissingChunk ) return 0;
+  cs->bMissingChunk = 0;
+  doltliteHashToHex(&cs->missingChunk, zHex);
+  return sqlite3_mprintf(
+      "no chunk source is available for missing chunk %s", zHex);
+}
+
+/* A miss explains only a failure that is otherwise a bare corruption or
+** not-found code; every call forgets the recorded misses. */
+char *doltliteTakeMissingChunkError(sqlite3 *db, int rc){
+  char *zErr = 0;
+  int i;
+  for(i=0; i<db->nDb; i++){
+    ChunkStore *cs = doltliteBtreeChunkStore(db->aDb[i].pBt);
+    if( !cs || !cs->bMissingChunk ) continue;
+    if( !zErr && ((rc & 0xff)==SQLITE_CORRUPT || rc==SQLITE_NOTFOUND) ){
+      zErr = chunkStoreTakeMissingChunkError(cs);
+    }
+    cs->bMissingChunk = 0;
+  }
+  return zErr;
+}
 
 int doltliteChunkSourceActive(sqlite3 *db){
   int i;
@@ -520695,6 +521229,37 @@ static SQLITE_INLINE int doltliteVtabColumnNameUsed(
   return 0;
 }
 
+/* The name doltliteAppendDisambiguatedColumnList gives column iName: the
+** prefixed name, suffixed with _1, _2, ... while it collides with another
+** column or a reserved name. NULL on OOM; the caller frees it. */
+static SQLITE_INLINE char *doltliteDisambiguatedColumnName(
+  char *const *azName,
+  int nName,
+  int iName,
+  const char *zPrefix,
+  const char *const *azReserved,
+  int nReserved
+){
+  char *zBase;
+  char *zColumn;
+  int iSuffix = 1;
+  if( !zPrefix ) zPrefix = "";
+  zBase = sqlite3_mprintf("%s%s",zPrefix,azName[iName]);
+  zColumn = zBase;
+  if( !zBase ) return 0;
+  while( doltliteVtabColumnNameUsed(azName,nName,iName,zPrefix,
+                                    azReserved,nReserved,zColumn) ){
+    if( zColumn!=zBase ) sqlite3_free(zColumn);
+    zColumn = sqlite3_mprintf("%s_%d",zBase,iSuffix++);
+    if( !zColumn ){
+      sqlite3_free(zBase);
+      return 0;
+    }
+  }
+  if( zColumn!=zBase ) sqlite3_free(zBase);
+  return zColumn;
+}
+
 static SQLITE_INLINE int doltliteAppendDisambiguatedColumnList(
   sqlite3_str *pStr,
   char *const *azName,
@@ -520707,28 +521272,16 @@ static SQLITE_INLINE int doltliteAppendDisambiguatedColumnList(
   char *const *azDecl
 ){
   int i;
-  if( !zPrefix ) zPrefix = "";
   if( !zSep ) zSep = ", ";
   for(i=0; i<nName; i++){
-    char *zBase = sqlite3_mprintf("%s%s",zPrefix,azName[i]);
-    char *zColumn = zBase;
-    int iSuffix = 1;
-    if( !zBase ) return SQLITE_NOMEM;
-    while( doltliteVtabColumnNameUsed(azName,nName,i,zPrefix,
-                                      azReserved,nReserved,zColumn) ){
-      if( zColumn!=zBase ) sqlite3_free(zColumn);
-      zColumn = sqlite3_mprintf("%s_%d",zBase,iSuffix++);
-      if( !zColumn ){
-        sqlite3_free(zBase);
-        return SQLITE_NOMEM;
-      }
-    }
+    char *zColumn = doltliteDisambiguatedColumnName(azName,nName,i,zPrefix,
+                                                    azReserved,nReserved);
+    if( !zColumn ) return SQLITE_NOMEM;
     if( i>0 ) sqlite3_str_appendall(pStr,zSep);
     sqlite3_str_appendf(pStr,"\"%w\"%s",zColumn,
                         azDecl ? azDecl[i]
                           : i==iIntegerPk ? " INTEGER" : "");
-    if( zColumn!=zBase ) sqlite3_free(zColumn);
-    sqlite3_free(zBase);
+    sqlite3_free(zColumn);
     if( sqlite3_str_errcode(pStr)!=SQLITE_OK ) return sqlite3_str_errcode(pStr);
   }
   return SQLITE_OK;
@@ -537373,6 +537926,7 @@ int doltliteHexToHash(const char *hex, ProllyHash *h){
 /* #include "doltlite_commit.h" */
 /* #include "doltlite_internal.h" */
 /* #include "doltlite_parse.h" */
+/* #include "prolly_btree_int.h" */
 
 static int doltliteRefComponentEndsLock(const char *zStart, const char *zEnd){
   return zEnd-zStart>=5 && memcmp(zEnd-5, ".lock", 5)==0;
@@ -537381,11 +537935,14 @@ static int doltliteRefComponentEndsLock(const char *zStart, const char *zEnd){
 static int doltliteLoadCommitFromStore(
   ChunkStore *cs,
   const ProllyHash *pHash,
-  DoltliteCommit *pCommit
+  DoltliteCommit *pCommit,
+  int *pMissing,
+  int eMissing
 ){
   u8 *data = 0;
   int nData = 0;
   int rc = chunkStoreGet(cs, pHash, &data, &nData);
+  if( rc==SQLITE_NOTFOUND && pMissing ) *pMissing = eMissing;
   if( rc!=SQLITE_OK ) return rc;
   rc = doltliteCommitDeserialize(data, nData, pCommit);
   sqlite3_free(data);
@@ -537396,10 +537953,12 @@ static int doltliteOpenRevisionBase(
   ChunkStore *cs,
   const char *zRef,
   ProllyHash *pCommit,
-  char **pzBranch
+  char **pzBranch,
+  int *pMissing
 ){
   DoltliteCommit commit;
   const char *zBranch = zRef;
+  int eMissing = OPEN_REVISION_MISSING_CHUNK;
   int rc;
 
   *pzBranch = 0;
@@ -537415,11 +537974,12 @@ static int doltliteOpenRevisionBase(
     rc = chunkStoreFindTag(cs, zRef, pCommit);
     if( rc!=SQLITE_OK && strlen(zRef)==PROLLY_HASH_SIZE*2 ){
       rc = doltliteHexToHash(zRef, pCommit);
+      eMissing = OPEN_REVISION_MISSING_HASH;
     }
   }
   if( rc!=SQLITE_OK || prollyHashIsEmpty(pCommit) ) return SQLITE_NOTFOUND;
   memset(&commit, 0, sizeof(commit));
-  rc = doltliteLoadCommitFromStore(cs, pCommit, &commit);
+  rc = doltliteLoadCommitFromStore(cs, pCommit, &commit, pMissing, eMissing);
   if( rc==SQLITE_OK ) doltliteCommitClear(&commit);
   return rc;
 }
@@ -537427,14 +537987,16 @@ static int doltliteOpenRevisionBase(
 static int doltliteOpenRevisionParent(
   ChunkStore *cs,
   ProllyHash *pCommit,
-  int iParent
+  int iParent,
+  int *pMissing
 ){
   DoltliteCommit commit;
   const ProllyHash *pParent;
   int rc;
 
   memset(&commit, 0, sizeof(commit));
-  rc = doltliteLoadCommitFromStore(cs, pCommit, &commit);
+  rc = doltliteLoadCommitFromStore(cs, pCommit, &commit, pMissing,
+                                   OPEN_REVISION_MISSING_CHUNK);
   if( rc!=SQLITE_OK ) return rc;
   pParent = doltliteCommitParentHash(&commit, iParent);
   if( !pParent ){
@@ -537451,7 +538013,8 @@ int doltliteResolveOpenRevision(
   const char *zRef,
   ProllyHash *pCommit,
   ProllyHash *pCatalog,
-  char **pzBranch
+  char **pzBranch,
+  int *pMissing
 ){
   DoltliteCommit commit;
   char *zBase = 0;
@@ -537461,6 +538024,7 @@ int doltliteResolveOpenRevision(
     return SQLITE_MISUSE;
   }
   *pzBranch = 0;
+  if( pMissing ) *pMissing = OPEN_REVISION_MISSING_NONE;
   nRef = (int)strlen(zRef);
   nBase = nRef;
   for(;;){
@@ -537474,11 +538038,11 @@ int doltliteResolveOpenRevision(
   }
   if( nBase==0 ) return SQLITE_NOTFOUND;
   if( nBase==nRef ){
-    rc = doltliteOpenRevisionBase(cs, zRef, pCommit, pzBranch);
+    rc = doltliteOpenRevisionBase(cs, zRef, pCommit, pzBranch, pMissing);
   }else{
     zBase = sqlite3_mprintf("%.*s", nBase, zRef);
     if( !zBase ) return SQLITE_NOMEM;
-    rc = doltliteOpenRevisionBase(cs, zBase, pCommit, pzBranch);
+    rc = doltliteOpenRevisionBase(cs, zBase, pCommit, pzBranch, pMissing);
     sqlite3_free(*pzBranch);
     *pzBranch = 0;
     sqlite3_free(zBase);
@@ -537501,16 +538065,17 @@ int doltliteResolveOpenRevision(
     }
     if( op=='~' ){
       for(j=0; j<n && rc==SQLITE_OK; j++){
-        rc = doltliteOpenRevisionParent(cs, pCommit, 0);
+        rc = doltliteOpenRevisionParent(cs, pCommit, 0, pMissing);
       }
     }else{
-      rc = doltliteOpenRevisionParent(cs, pCommit, n-1);
+      rc = doltliteOpenRevisionParent(cs, pCommit, n-1, pMissing);
     }
     if( rc!=SQLITE_OK ) return rc;
   }
 
   memset(&commit, 0, sizeof(commit));
-  rc = doltliteLoadCommitFromStore(cs, pCommit, &commit);
+  rc = doltliteLoadCommitFromStore(cs, pCommit, &commit, pMissing,
+                                   OPEN_REVISION_MISSING_CHUNK);
   if( rc==SQLITE_OK ) memcpy(pCatalog, &commit.catalogHash, sizeof(*pCatalog));
   doltliteCommitClear(&commit);
   return rc;
@@ -564335,10 +564900,38 @@ const sqlite3_module *doltliteHistoryTableModule(void){
 #define AT_IDX_PK_ANY \
   (AT_IDX_PK_EQ|AT_IDX_PK_GE|AT_IDX_PK_LE|AT_IDX_PK_GT|AT_IDX_PK_LT)
 
+/* A table without a rowid is declared WITHOUT ROWID with its primary key,
+** so SQLite identifies its rows by key: a RIGHT or FULL JOIN records which
+** right-hand rows matched by rowid, or by primary key for WITHOUT ROWID, and
+** a scan position is not stable across the PK seeks xFilter does. Tables
+** with a rowid report their integer key from atRowid instead. */
+static int atAppendPrimaryKey(sqlite3_str *pStr, const DoltliteColInfo *ci,
+                              const char *const *azReserved, int nReserved){
+  int k, i;
+  if( ci->bHasRowid || ci->nPk<=0 || !ci->aColToRec ) return SQLITE_OK;
+  for(k=0; k<ci->nPk; k++){
+    for(i=0; i<ci->nCol && ci->aColToRec[i]!=k; i++){}
+    if( i==ci->nCol ) return SQLITE_OK;
+  }
+  sqlite3_str_appendall(pStr, ", PRIMARY KEY(");
+  for(k=0; k<ci->nPk; k++){
+    char *zColumn;
+    for(i=0; ci->aColToRec[i]!=k; i++){}
+    zColumn = doltliteDisambiguatedColumnName(ci->azName,ci->nCol,i,"",
+                                              azReserved,nReserved);
+    if( !zColumn ) return SQLITE_NOMEM;
+    sqlite3_str_appendf(pStr, "%s\"%w\"", k>0 ? ", " : "", zColumn);
+    sqlite3_free(zColumn);
+  }
+  sqlite3_str_appendall(pStr, ")");
+  return sqlite3_str_errcode(pStr);
+}
+
 static char *atBuildSchema(const DoltliteColInfo *ci){
   static const char *const azReserved[] = {"commit_ref"};
   sqlite3_str *pStr = sqlite3_str_new(0);
   char *z;
+  int bWithoutRowid = 0;
   if( !pStr ) return 0;
   sqlite3_str_appendall(pStr, "CREATE TABLE x(");
   if( doltliteAppendDisambiguatedColumnList(
@@ -564347,7 +564940,17 @@ static char *atBuildSchema(const DoltliteColInfo *ci){
     sqlite3_str_reset(pStr);
     return 0;
   }
-  sqlite3_str_appendall(pStr, ", commit_ref TEXT HIDDEN)");
+  sqlite3_str_appendall(pStr, ", commit_ref TEXT HIDDEN");
+  {
+    sqlite3_uint64 nBefore = (sqlite3_uint64)sqlite3_str_length(pStr);
+    if( atAppendPrimaryKey(pStr,ci,azReserved,ArraySize(azReserved))
+          !=SQLITE_OK ){
+      sqlite3_str_reset(pStr);
+      return 0;
+    }
+    bWithoutRowid = (sqlite3_uint64)sqlite3_str_length(pStr)>nBefore;
+  }
+  sqlite3_str_appendall(pStr, bWithoutRowid ? ") WITHOUT ROWID" : ")");
   z = sqlite3_str_finish(pStr);
   return z;
 }
@@ -565334,12 +565937,24 @@ static int atColumn(sqlite3_vtab_cursor *cur, sqlite3_context *ctx, int col){
   return SQLITE_OK;
 }
 
+/* A rowid table's rows are identified by their integer key, which is stable
+** however the scan reached the row; see atAppendPrimaryKey. */
+static int atRowid(sqlite3_vtab_cursor *cur, sqlite3_int64 *pRowid){
+  AtCursor *c=(AtCursor*)cur;
+  if( c->common.rootIntKey && c->common.tblCurOpen
+   && prollyCursorIsValid(&c->common.tblCur) ){
+    *pRowid = prollyCursorIntKey(&c->common.tblCur);
+    return SQLITE_OK;
+  }
+  return doltliteVtabCommonRowid(cur, pRowid);
+}
+
 static sqlite3_module atModule = {
   0, atConnect, atConnect, atBestIndex,
   doltliteVtabCommonDisconnect, doltliteVtabCommonDisconnect,
   atOpen, atClose,
   atFilter, atNext,
-  doltliteVtabCommonEof, atColumn, doltliteVtabCommonRowid,
+  doltliteVtabCommonEof, atColumn, atRowid,
   0,0,0,0,0,0,0,0,0,0,0,0
 };
 
@@ -582738,11 +583353,36 @@ static int syncVerifyFetchedChunk(
   return SQLITE_OK;
 }
 
-int doltliteSyncChunks(
+/* A ref is published only after its whole graph is uploaded, so a root
+** the destination already names as a branch or tag target needs no
+** partial-put rescan. */
+static int syncRootIsPublished(const ChunkStore *pDstRefs,
+                               const ProllyHash *pRoot){
+  const BranchRef *aBranch;
+  const TagRef *aTag;
+  int nBranch;
+  int nTag;
+  int i;
+  if( !pDstRefs ) return 0;
+  refsTableGetBranches(&pDstRefs->refs, &nBranch, &aBranch);
+  for(i=0; i<nBranch; i++){
+    if( prollyHashCompare(&aBranch[i].commitHash, pRoot)==0 ) return 1;
+  }
+  refsTableGetTags(&pDstRefs->refs, &nTag, &aTag);
+  for(i=0; i<nTag; i++){
+    if( prollyHashCompare(&aTag[i].commitHash, pRoot)==0 ) return 1;
+  }
+  return 0;
+}
+
+/* pDstRefs, when set, holds the destination's refs: roots that are
+** already published ref targets skip the partial-put resume scan. */
+static int syncChunks(
   DoltliteRemote *pSrc,
   DoltliteRemote *pDst,
   ProllyHash *aRoots,
-  int nRoots
+  int nRoots,
+  const ChunkStore *pDstRefs
 ){
   SyncQueue queue;
   ProllyHashSet seen;
@@ -582789,13 +583429,16 @@ int doltliteSyncChunks(
       bResumeScan = 1;
       pDst->bForceResumeScan = 0;
     }else if( bFirstBatch && pDst->bResumePartialPuts ){
+      int bUnpublished = 0;
       bResumeScan = 1;
       for(i=0; i<nBatch; i++){
         if( !pB->aPresent[i] ){
           bResumeScan = 0;
           break;
         }
+        if( !syncRootIsPublished(pDstRefs, &pB->aBatch[i]) ) bUnpublished = 1;
       }
+      if( !bUnpublished ) bResumeScan = 0;
     }
     bFirstBatch = 0;
 
@@ -582859,6 +583502,15 @@ int doltliteSyncChunks(
   return rc;
 }
 
+int doltliteSyncChunks(
+  DoltliteRemote *pSrc,
+  DoltliteRemote *pDst,
+  ProllyHash *aRoots,
+  int nRoots
+){
+  return syncChunks(pSrc, pDst, aRoots, nRoots, 0);
+}
+
 /* FsRemote and LocalAsRemote both start with the vtable then ChunkStore*,
 ** so chunk/refs reads can use one cast. */
 typedef struct RemoteStoreHdr RemoteStoreHdr;
@@ -582884,6 +583536,7 @@ static int remoteGetChunks(DoltliteRemote *pRemote, const ProllyHash *aHash,
                            int nHash, u8 **apData, int *anData){
   ChunkStore *pStore = ((RemoteStoreHdr*)pRemote)->pStore;
   int i = 0;
+  int iPrefetched = 0;
   int rc = SQLITE_OK;
   if( nHash<0 ) return SQLITE_MISUSE;
   if( nHash==0 ) return SQLITE_OK;
@@ -582891,6 +583544,14 @@ static int remoteGetChunks(DoltliteRemote *pRemote, const ProllyHash *aHash,
   memset(anData, 0, nHash*sizeof(*anData));
   while( i<nHash && rc==SQLITE_OK ){
     int nRead;
+    /* A lazy store faults each absent chunk with its own origin request;
+    ** fetch this batch's absent chunks in one batched request first. */
+    if( pStore->pChunkSource && i>=iPrefetched ){
+      int nPrefetch = MIN(nHash-i, CHUNK_READ_BATCH_MAX);
+      rc = chunkStoreSourcePrefetchMany(pStore, &aHash[i], nPrefetch);
+      if( rc!=SQLITE_OK ) break;
+      iPrefetched = i + nPrefetch;
+    }
     rc = chunkStoreReadBatch(pStore, &aHash[i],
                              MIN(nHash-i, CHUNK_READ_BATCH_MAX),
                              &apData[i], &anData[i], &nRead);
@@ -583869,7 +584530,7 @@ static int remoteValidateScopedRefsUpdate(
   const RemoteRef *aCurRem = 0, *aIncRem = 0;
   const TrackingBranch *aCurTrk = 0, *aIncTrk = 0;
   const SequenceRef *aCurSeq = 0, *aIncSeq = 0;
-  const char *zTag = remoteScopedTagName(zRef);
+  const char *zTag;
   int nCur = 0, nInc = 0, nCurTag = 0, nIncTag = 0;
   int nCurRem = 0, nIncRem = 0, nCurTrk = 0, nIncTrk = 0;
   int nCurSeq = 0, nIncSeq = 0;
@@ -583879,7 +584540,9 @@ static int remoteValidateScopedRefsUpdate(
   int i, j;
 
   if( bDelete ) zRef++;
-  if( bDelete && scopedSameText(zRef, scopedDefaultBranch(pBasis)) ){
+  /* A ":tag:<name>" scope deletes the tag, as ":<branch>" deletes a branch. */
+  zTag = remoteScopedTagName(zRef);
+  if( bDelete && !zTag && scopedSameText(zRef, scopedDefaultBranch(pBasis)) ){
     return SQLITE_CONSTRAINT;
   }
   if( !zRef || !zRef[0] ) return SQLITE_MISUSE;
@@ -583913,6 +584576,7 @@ static int remoteValidateScopedRefsUpdate(
 
   if( zTag ){
     const TagRef *incTag = 0;
+    int curHasTag = 0;
     if( !scopedBranchesMatch(aCur, nCur, aInc, nInc)
      || !scopedRemotesMatch(aCurRem, nCurRem, aIncRem, nIncRem)
      || !scopedTrackingMatch(aCurTrk, nCurTrk, aIncTrk, nIncTrk)
@@ -583923,7 +584587,10 @@ static int remoteValidateScopedRefsUpdate(
       goto done;
     }
     for(i=0; i<nCurTag; i++){
-      if( strcmp(aCurTag[i].zName, zTag)==0 ) continue;
+      if( strcmp(aCurTag[i].zName, zTag)==0 ){
+        curHasTag = 1;
+        continue;
+      }
       for(j=0; j<nIncTag; j++){
         if( strcmp(aIncTag[j].zName, aCurTag[i].zName)==0 ) break;
       }
@@ -583946,7 +584613,11 @@ static int remoteValidateScopedRefsUpdate(
         goto done;
       }
     }
-    rc = incTag ? SQLITE_OK : SQLITE_CONSTRAINT;
+    if( bDelete ){
+      rc = !incTag && curHasTag ? SQLITE_OK : SQLITE_CONSTRAINT;
+    }else{
+      rc = incTag ? SQLITE_OK : SQLITE_CONSTRAINT;
+    }
     goto done;
   }
 
@@ -584219,7 +584890,7 @@ int doltliteMergeScopedRefsUpdate(
   int nBaseBlob = 0;
   int nCurrentBlob = 0;
   int rc;
-  const char *zTag = remoteScopedTagName(zRef);
+  const char *zTag = remoteScopedTagName(zRef + (zRef[0]==':'));
 
   PROLLY_ASSERT_STORE_GRAPH_LOCKED(pStore);
   *ppMerged = 0;
@@ -584486,7 +585157,7 @@ int doltlitePushAs(
         rc = SQLITE_NOMEM;
         goto push_done;
       }
-      rc = doltliteSyncChunks(pLocalSrc, pRemote, &localCommit, 1);
+      rc = syncChunks(pLocalSrc, pRemote, &localCommit, 1, &refs);
       pLocalSrc->xClose(pLocalSrc);
       if( rc!=SQLITE_OK ) goto push_done;
       {
@@ -584588,7 +585259,8 @@ int doltlitePushTag(
       rc = SQLITE_NOMEM;
       break;
     }
-    rc = doltliteSyncChunks(pLocalSrc, pRemote, &tagCommit, 1);
+    rc = syncChunks(pLocalSrc, pRemote, &tagCommit, 1,
+                              &originalRefs);
     pLocalSrc->xClose(pLocalSrc);
     if( rc!=SQLITE_OK ) goto tag_attempt_done;
 
@@ -584644,6 +585316,94 @@ tag_attempt_done:
   }
 
 tag_done:
+  chunkStoreClose(&originalRefs);
+  return rc;
+}
+
+/* Delete tag zTag from the remote. As in doltlitePushTag, the refs update is
+** a compare-and-swap scoped to the tag: it is retried when other refs change
+** and refused when the tag itself moves. SQLITE_NOTFOUND if the remote has no
+** such tag. */
+int doltliteDeleteRemoteTag(DoltliteRemote *pRemote, const char *zTag){
+  const TagRef *pOriginalTag;
+  ChunkStore originalRefs;
+  u8 *refsData = 0;
+  int nRefsData = 0;
+  int attempt;
+  int rc;
+
+  memset(&originalRefs, 0, sizeof(originalRefs));
+  rc = pRemote->xGetRefs(pRemote, &refsData, &nRefsData);
+  if( rc==SQLITE_OK && refsData ){
+    rc = chunkStoreLoadRefsFromBlob(&originalRefs, refsData, nRefsData);
+  }else if( rc==SQLITE_NOTFOUND ){
+    rc = SQLITE_OK;
+  }
+  sqlite3_free(refsData);
+  refsData = 0;
+  if( rc!=SQLITE_OK ) goto delete_tag_done;
+  pOriginalTag = remoteFindTag(&originalRefs, zTag);
+  if( !pOriginalTag ){
+    rc = SQLITE_NOTFOUND;
+    goto delete_tag_done;
+  }
+
+  for(attempt=0; attempt<64; attempt++){
+    ChunkStore nextRefs;
+    const TagRef *pCurrentTag;
+    ProllyHash expectedRefsHash = {{0}};
+    u8 *newRefs = 0;
+    char *zScope = 0;
+    int nNewRefs = 0;
+    int targetChanged = 0;
+
+    remotePushRetryDelay(attempt);
+    memset(&nextRefs, 0, sizeof(nextRefs));
+    nRefsData = 0;
+    rc = pRemote->xGetRefs(pRemote, &refsData, &nRefsData);
+    if( rc==SQLITE_NOTFOUND ) rc = SQLITE_OK;
+    if( rc==SQLITE_OK && refsData && nRefsData>0 ){
+      prollyHashCompute(refsData, nRefsData, &expectedRefsHash);
+      rc = chunkStoreLoadRefsFromBlob(&nextRefs, refsData, nRefsData);
+    }
+    if( rc!=SQLITE_OK ) goto delete_tag_attempt_done;
+    pCurrentTag = remoteFindTag(&nextRefs, zTag);
+    if( !scopedTagsMatch(pOriginalTag, 1, pCurrentTag, pCurrentTag!=0) ){
+      targetChanged = 1;
+      rc = pCurrentTag ? SQLITE_BUSY_SNAPSHOT : SQLITE_NOTFOUND;
+      goto delete_tag_attempt_done;
+    }
+    rc = chunkStoreDeleteTag(&nextRefs, zTag);
+    if( rc==SQLITE_OK ){
+      rc = chunkStoreSerializeRefsToBlob(&nextRefs, &newRefs, &nNewRefs);
+    }
+    if( rc==SQLITE_OK ){
+      zScope = sqlite3_mprintf(":%s%s", REMOTE_TAG_SCOPE_PREFIX, zTag);
+      if( !zScope ) rc = SQLITE_NOMEM;
+    }
+    if( rc==SQLITE_OK ){
+      if( pRemote->xSetRefsIf ){
+        rc = pRemote->xSetRefsIf(
+            pRemote, &expectedRefsHash, zScope, 1, newRefs, nNewRefs);
+      }else{
+        rc = pRemote->xSetRefs(pRemote, zScope, 1, newRefs, nNewRefs);
+      }
+    }
+    if( rc==SQLITE_OK ){
+      doltliteTestCrashFinalize("push");
+      rc = pRemote->xCommit(pRemote);
+    }
+
+delete_tag_attempt_done:
+    sqlite3_free(refsData);
+    refsData = 0;
+    sqlite3_free(zScope);
+    sqlite3_free(newRefs);
+    chunkStoreClose(&nextRefs);
+    if( rc!=SQLITE_BUSY_SNAPSHOT || targetChanged ) break;
+  }
+
+delete_tag_done:
   chunkStoreClose(&originalRefs);
   return rc;
 }
@@ -585491,6 +586251,7 @@ static DoltliteRemote *openRemoteByUrl(
   }
   if( strncmp(zUrl, "http://", 7)==0 || strncmp(zUrl, "https://", 8)==0 ){
     pRemote = doltliteHttpRemoteOpen(zUrl);
+    doltliteHttpRemoteSetConnection(pRemote, db);
     doltliteRemoteSetBusyHandler(pRemote, remoteSqlBusyHandler, db);
     return pRemote;
   }
@@ -585897,7 +586658,7 @@ static int remoteSqlSelectLazyRevision(
   memset(&commitHash, 0, sizeof(commitHash));
   memset(&catalogHash, 0, sizeof(catalogHash));
   rc = doltliteResolveOpenRevision(
-      cs, zRevision, &commitHash, &catalogHash, &zBranch);
+      cs, zRevision, &commitHash, &catalogHash, &zBranch, 0);
   if( rc!=SQLITE_OK ){
     sqlite3_free(zBranch);
     return rc;
@@ -586074,8 +586835,8 @@ static const char *remoteSqlStripPrefix(const char *z, const char *zPrefix){
   return strncmp(z, zPrefix, n)==0 ? z + n : z;
 }
 
-/* zRef is a branch, tag, ":branch", or "src:dst" refspec. src may be any
-** revision, not only a branch name. */
+/* zRef is a branch, tag, ":branch", ":refs/tags/tag", or "src:dst" refspec.
+** src may be any revision, not only a branch name. */
 static int doltPushParsedFunc(
   sqlite3_context *ctx,
   const char *zRemoteName,
@@ -586096,6 +586857,7 @@ static int doltPushParsedFunc(
   PushTrackingMutation mutation;
   int bBranch = 0;
   int bTagRef = 0;
+  int bTagDelete = 0;
   int bLocalLock = 0;
   int bPrecondition = 0;
   int rc;
@@ -586104,7 +586866,19 @@ static int doltPushParsedFunc(
   if( !cs ){ doltliteVcResultError(ctx, db, "no database"); return SQLITE_ERROR; }
   memset(&srcCommit, 0, sizeof(srcCommit));
 
-  if( zColon
+  /* ":refs/tags/<tag>" deletes a remote tag, as in git. Dolt refuses it as an
+  ** unsupported mapping; mapping a source onto a tag is still refused. */
+  if( zColon==zRefSpec && zColon
+   && strncmp(zColon+1, REMOTE_TAGS_PREFIX, strlen(REMOTE_TAGS_PREFIX))==0 ){
+    bTagDelete = 1;
+    zRef = zColon + 1 + strlen(REMOTE_TAGS_PREFIX);
+    if( !zRef[0] ){
+      (void)doltliteVcSealSavepointError(db);
+      remoteSqlResultError(ctx, SQLITE_MISUSE,
+                           "push failed: tag name required after ':refs/tags/'");
+      return SQLITE_MISUSE;
+    }
+  }else if( zColon
    && strncmp(zColon+1, REMOTE_TAGS_PREFIX, strlen(REMOTE_TAGS_PREFIX))==0 ){
     char *zMsg = sqlite3_mprintf("unsupported mapping: '%s'", zRefSpec);
     if( !zMsg ){ sqlite3_result_error_nomem(ctx); return SQLITE_NOMEM; }
@@ -586153,7 +586927,7 @@ static int doltPushParsedFunc(
         return SQLITE_NOTFOUND;
       }
     }
-  }else if( zRef ){
+  }else if( zRef && !bTagDelete ){
     if( zRef[0]==':' ){
       const char *zBranch = remoteSqlStripPrefix(zRef+1, REMOTE_HEADS_PREFIX);
       if( zBranch!=zRef+1 ){
@@ -586176,7 +586950,9 @@ static int doltPushParsedFunc(
     return rc ? rc : SQLITE_ERROR;
   }
 
-  if( bTags ){
+  if( bTagDelete ){
+    rc = doltliteDeleteRemoteTag(pRemote, zRef);
+  }else if( bTags ){
     const TagRef *aTag = 0;
     int nTag = 0;
     int i;
@@ -586248,6 +587024,11 @@ static int doltPushParsedFunc(
       zOwned = sqlite3_mprintf(
           "failed to delete remote; 'refs/heads/%s' from remote '%s'; "
           "branch not found", mutation.zBranch, zRemoteName);
+      if( !zOwned ) rc = SQLITE_NOMEM;
+    }else if( bTagDelete && rc==SQLITE_NOTFOUND ){
+      zOwned = sqlite3_mprintf(
+          "failed to delete remote; 'refs/tags/%s' from remote '%s'; "
+          "tag not found", zRef, zRemoteName);
       if( !zOwned ) rc = SQLITE_NOMEM;
     }else{
       zOwned = zMsg && !bRejected ? sqlite3_mprintf("%s", zMsg) : 0;
@@ -587803,25 +588584,294 @@ static sqlite3_module remotesModule = {
 #define DOLTLITE_DEFAULT_LOGIN_URL "https://dolthub.com/settings/credentials"
 
 #ifdef DOLTLITE_HAVE_AUTH
+static DoltliteCreds *credsSqlCurrent(sqlite3 *db){
+  const char *session = sqlite3_get_clientdata(db, DOLTLITE_CREDS_SESSION);
+  DoltliteCreds *cred = 0;
+  if( session ){
+    char *error = 0;
+    doltliteCredsResolve(0, session, 0, &cred, 0, &error);
+    sqlite3_free(error);
+  }else{
+    doltliteCredsLoadDefault(0, &cred);
+  }
+  return cred;
+}
+
+static int credsSqlSelectDefault(DoltliteCreds *cred){
+  char *kid = doltliteCredsKid(cred);
+  int rc = kid ? doltliteCredsConfigSet(0, "user.creds", kid, 1) : 1;
+  sqlite3_free(kid);
+  return rc;
+}
+
+static void doltCredsUseFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
+  sqlite3 *db = sqlite3_context_db_handle(ctx);
+  const char *name, *scope = 0;
+  DoltliteCreds *cred = 0;
+  char *kid;
+  int rc;
+  if( argc<1 || argc>2 || sqlite3_value_type(argv[0])!=SQLITE_TEXT
+   || (argc==2 && sqlite3_value_type(argv[1])!=SQLITE_TEXT) ){
+    sqlite3_result_error(ctx, "usage: dolt_creds_use(key [, 'session'])", -1);
+    return;
+  }
+  name = (const char*)sqlite3_value_text(argv[0]);
+  if( argc==2 ) scope = (const char*)sqlite3_value_text(argv[1]);
+  if( scope && strcmp(scope, "session") ){
+    sqlite3_result_error(ctx, "credential scope must be 'session'", -1);
+    return;
+  }
+  if( !name ){ sqlite3_result_error_nomem(ctx); return; }
+  if( strcmp(name, "anonymous")==0 ) kid = sqlite3_mprintf("anonymous");
+  else{
+    if( doltliteCredsLoadNamed(0, name, &cred) ){
+      sqlite3_result_error(ctx, "no such credential or invalid private key", -1);
+      return;
+    }
+    kid = doltliteCredsKid(cred);
+    doltliteCredsFree(cred);
+  }
+  if( !kid ){ sqlite3_result_error_nomem(ctx); return; }
+  if( scope ){
+    rc = sqlite3_set_clientdata(db, DOLTLITE_CREDS_SESSION, kid, sqlite3_free);
+    if( rc!=SQLITE_OK ) sqlite3_result_error_code(ctx, rc);
+    else sqlite3_result_int(ctx, 0);
+  }else{
+    rc = doltliteCredsConfigSet(0, "user.creds", kid, 0);
+    sqlite3_free(kid);
+    if( rc ) sqlite3_result_error(ctx, "failed to save credential selection", -1);
+    else sqlite3_result_int(ctx, 0);
+  }
+}
+
+static void doltCredsImportFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
+  const char *path;
+  DoltliteCreds *cred = 0;
+  if( argc==2 && sqlite3_value_type(argv[0])==SQLITE_TEXT
+   && sqlite3_stricmp((const char*)sqlite3_value_text(argv[0]), "--no-profile")==0 ){
+    argc--;
+    argv++;
+  }
+  if( argc!=1 || sqlite3_value_type(argv[0])!=SQLITE_TEXT ){
+    sqlite3_result_error(ctx, "usage: dolt_creds_import(['--no-profile',] jwk_filename)", -1);
+    return;
+  }
+  path = (const char*)sqlite3_value_text(argv[0]);
+  if( !path ){ sqlite3_result_error_nomem(ctx); return; }
+  if( doltliteCredsImport(path, &cred) ){
+    sqlite3_result_error(ctx, "could not read a valid private JWK credential", -1);
+  }else if( doltliteCredsSave(cred, 0) || credsSqlSelectDefault(cred) ){
+    sqlite3_result_error(ctx, "failed to save imported credential or selection", -1);
+  }else{
+    sqlite3_result_int(ctx, 0);
+  }
+  doltliteCredsFree(cred);
+}
+
+static void doltCredsRmFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
+  int i;
+  if( argc<1 ){
+    sqlite3_result_error(ctx, "usage: dolt_creds_rm(key [, key ...])", -1);
+    return;
+  }
+  for(i=0; i<argc; i++){
+    const char *name = (const char*)sqlite3_value_text(argv[i]);
+    if( !name || doltliteCredsRemove(0, name) ){
+      sqlite3_result_error(ctx, "no such credential or failed to remove credential", -1);
+      return;
+    }
+  }
+  sqlite3_result_int(ctx, 0);
+}
+
+static const char *credsSqlRemoteUrl(sqlite3 *db, const char *name){
+  const char *url = 0;
+  ChunkStore *cs;
+  if( !name ) return 0;
+  if( strncmp(name, "https://", 8)==0 ) return name;
+  cs = doltliteGetChunkStore(db);
+  if( cs && chunkStoreFindRemote(cs, name, &url)==SQLITE_OK
+   && url && strncmp(url, "https://", 8)==0 ) return url;
+  return 0;
+}
+
+static void doltCredsBindFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
+  sqlite3 *db = sqlite3_context_db_handle(ctx);
+  const char *url, *name;
+  char *key, *kid = 0;
+  DoltliteCreds *cred = 0;
+  int rc;
+  if( argc!=2 || sqlite3_value_type(argv[0])!=SQLITE_TEXT
+   || sqlite3_value_type(argv[1])!=SQLITE_TEXT ){
+    sqlite3_result_error(ctx, "usage: dolt_creds_bind(remote_or_https_url, key)", -1);
+    return;
+  }
+  url = credsSqlRemoteUrl(db, (const char*)sqlite3_value_text(argv[0]));
+  if( !url ){
+    sqlite3_result_error(ctx, "unknown remote or HTTPS URL required", -1);
+    return;
+  }
+  name = (const char*)sqlite3_value_text(argv[1]);
+  if( !name ){ sqlite3_result_error_nomem(ctx); return; }
+  if( strcmp(name, "anonymous")==0 ) kid = sqlite3_mprintf("anonymous");
+  else if( !doltliteCredsLoadNamed(0, name, &cred) ) kid = doltliteCredsKid(cred);
+  else{
+    sqlite3_result_error(ctx, "no such credential or invalid private key", -1);
+    return;
+  }
+  doltliteCredsFree(cred);
+  key = doltliteCredsRemoteKey(url);
+  rc = key && kid ? doltliteCredsConfigSet(0, key, kid, 0) : 1;
+  sqlite3_free(key);
+  sqlite3_free(kid);
+  if( rc ) sqlite3_result_error(ctx, "failed to save remote credential binding", -1);
+  else sqlite3_result_int(ctx, 0);
+}
+
+typedef struct CredsRow CredsRow;
+struct CredsRow {
+  char *kid;
+  char *pub;
+  int active;
+};
+typedef struct CredsVtab CredsVtab;
+struct CredsVtab { sqlite3_vtab base; sqlite3 *db; };
+typedef struct CredsCur CredsCur;
+struct CredsCur {
+  sqlite3_vtab_cursor base;
+  CredsRow *rows;
+  int n;
+  int i;
+};
+
+static void credsRowsClear(CredsCur *c){
+  int i;
+  for(i=0; i<c->n; i++){
+    sqlite3_free(c->rows[i].kid);
+    sqlite3_free(c->rows[i].pub);
+  }
+  sqlite3_free(c->rows);
+  c->rows = 0;
+  c->n = c->i = 0;
+}
+static int credsConnect(sqlite3 *db, void *aux, int n, const char *const*a,
+                        sqlite3_vtab **out, char **err){
+  int rc;
+  (void)aux; (void)n; (void)a; (void)err;
+  rc = doltliteVtabConnectSimple(db,
+      "CREATE TABLE x(kid TEXT, public_key TEXT, active BOOLEAN, error TEXT)",
+      sizeof(CredsVtab), out);
+  if( rc==SQLITE_OK ){
+    ((CredsVtab*)*out)->db = db;
+    sqlite3_vtab_config(db, SQLITE_VTAB_DIRECTONLY);
+  }
+  return rc;
+}
+static int credsBestIndex(sqlite3_vtab *v, sqlite3_index_info *p){
+  (void)v;
+  p->estimatedCost = 10;
+  p->estimatedRows = 10;
+  return SQLITE_OK;
+}
+static int credsOpen(sqlite3_vtab *v, sqlite3_vtab_cursor **out){
+  (void)v;
+  return doltliteVtabOpenCursor(out, sizeof(CredsCur));
+}
+static int credsClose(sqlite3_vtab_cursor *cur){
+  credsRowsClear((CredsCur*)cur);
+  sqlite3_free(cur);
+  return SQLITE_OK;
+}
+static int credsFilter(sqlite3_vtab_cursor *cur, int idx, const char *str,
+                       int argc, sqlite3_value **argv){
+  CredsCur *c = (CredsCur*)cur;
+  sqlite3 *db = ((CredsVtab*)cur->pVtab)->db;
+  DoltliteCreds *active = 0;
+  char *activeKid = 0;
+  char **kids = 0;
+  int n = 0, i, rc = SQLITE_OK;
+  (void)idx; (void)str; (void)argc; (void)argv;
+  credsRowsClear(c);
+  if( doltliteCredsList(0, &kids, &n) ) return SQLITE_IOERR;
+  active = credsSqlCurrent(db);
+  if( active ) activeKid = doltliteCredsKid(active);
+  doltliteCredsFree(active);
+  if( n ){
+    c->rows = sqlite3_malloc64(n * sizeof(CredsRow));
+    if( !c->rows ){ rc = SQLITE_NOMEM; goto done; }
+    memset(c->rows, 0, n * sizeof(CredsRow));
+    c->n = n;
+  }
+  for(i=0; i<n; i++){
+    DoltliteCreds *cred = 0;
+    c->rows[i].kid = kids[i];
+    kids[i] = 0;
+    if( !doltliteCredsLoad(0, c->rows[i].kid, &cred) ){
+      c->rows[i].pub = doltliteCredsPubKeyB32(cred);
+      doltliteCredsFree(cred);
+      if( !c->rows[i].pub ){ rc = SQLITE_NOMEM; break; }
+      c->rows[i].active = activeKid && strcmp(activeKid, c->rows[i].kid)==0;
+    }
+  }
+done:
+  sqlite3_free(activeKid);
+  doltliteCredsFreeList(kids, n);
+  return rc;
+}
+static int credsNext(sqlite3_vtab_cursor *c){ ((CredsCur*)c)->i++; return SQLITE_OK; }
+static int credsEof(sqlite3_vtab_cursor *c){ return ((CredsCur*)c)->i>=((CredsCur*)c)->n; }
+static int credsColumn(sqlite3_vtab_cursor *cur, sqlite3_context *ctx, int col){
+  CredsCur *c = (CredsCur*)cur;
+  CredsRow *r = &c->rows[c->i];
+  if( col==0 ) sqlite3_result_text(ctx, r->kid, -1, SQLITE_TRANSIENT);
+  else if( col==1 ) sqlite3_result_text(ctx, r->pub, -1, SQLITE_TRANSIENT);
+  else if( col==2 ) sqlite3_result_int(ctx, r->active);
+  else if( !r->pub ) sqlite3_result_text(ctx, "unreadable or invalid credential", -1, SQLITE_STATIC);
+  return SQLITE_OK;
+}
+static int credsRowid(sqlite3_vtab_cursor *c, sqlite3_int64 *rowid){
+  *rowid = ((CredsCur*)c)->i;
+  return SQLITE_OK;
+}
+static sqlite3_module credsModule = {
+  0,0,credsConnect,credsBestIndex,doltliteVtabDisconnect,0,
+  credsOpen,credsClose,credsFilter,credsNext,credsEof,credsColumn,credsRowid,
+  0,0,0,0,0,0,0,0,0,0,0,0
+};
+
 static void doltCredsNewFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
   sqlite3 *db = sqlite3_context_db_handle(ctx);
   DoltliteCreds *cred = 0;
-  char *kid = 0, *pub = 0, *msg = 0;
+  char *kid = 0, *pub = 0, *msg = 0, *dir = 0;
   const char *loginUrl;
-  (void)argc;
   (void)argv;
+  if( argc!=0 ){
+    sqlite3_result_error(ctx, "dolt_creds_new() takes no arguments", -1);
+    return;
+  }
 
   if( doltliteCredsGenerate(&cred)!=0 ){
     doltliteVcResultError(ctx, db, "failed to generate credential");
     return;
   }
-  if( doltliteCredsSave(cred, 0)!=0 ){
+  dir = doltliteCredsDir();
+  if( !dir || doltliteCredsSave(cred, dir)!=0 ){
     doltliteCredsFree(cred);
-    doltliteVcResultError(ctx, db,
-        "failed to save credential under ~/.doltlite/creds (is $HOME set?)");
+    msg = sqlite3_mprintf("failed to save credential under %s",
+        dir ? dir : "DOLTLITE_CREDS_DIR or HOME (not set)");
+    if( msg ) doltliteVcResultError(ctx, db, msg);
+    else sqlite3_result_error_nomem(ctx);
+    sqlite3_free(msg);
+    sqlite3_free(dir);
     return;
   }
+  sqlite3_free(dir);
 
+  if( credsSqlSelectDefault(cred) ){
+    doltliteCredsFree(cred);
+    sqlite3_result_error(ctx, "failed to save credential selection", -1);
+    return;
+  }
   kid = doltliteCredsKid(cred);
   pub = doltliteCredsPubKeyB32(cred);
   loginUrl = getenv("DOLTLITE_LOGIN_URL");
@@ -587847,6 +588897,47 @@ static void doltCredsNewFunc(sqlite3_context *ctx, int argc, sqlite3_value **arg
   doltliteCredsFree(cred);
 }
 
+static void doltCredsExportFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
+  sqlite3 *db = sqlite3_context_db_handle(ctx);
+  const char *kid;
+  DoltliteCreds *cred = 0;
+  if( argc<1 || argc>2 || !sqlite3_value_text(argv[0]) ||
+      (argc==2 && !sqlite3_value_text(argv[1])) ){
+    doltliteVcResultError(ctx, db,
+        "usage: dolt_creds('export', <kid> [, <authorized-keys-dir>])");
+    return;
+  }
+  kid = (const char*)sqlite3_value_text(argv[0]);
+  if( doltliteCredsLoadNamed(0, kid, &cred)!=0 ){
+    doltliteVcResultError(ctx, db, "no such credential");
+    return;
+  }
+  if( argc==1 ){
+    char *json = doltliteCredsToPublicJwk(cred);
+    if( json ){
+      sqlite3_result_text(ctx, json, -1, SQLITE_TRANSIENT);
+      sqlite3_free(json);
+    }else{
+      doltliteVcResultError(ctx, db, "out of memory");
+    }
+  }else{
+    const char *dir = (const char*)sqlite3_value_text(argv[1]);
+    if( doltliteCredsSavePublic(cred, dir)!=0 ){
+      doltliteVcResultError(ctx, db, "failed to export public credential");
+    }else{
+      char *msg = sqlite3_mprintf(
+          "Exported public credential %s to %s", kid, dir);
+      if( msg ){
+        sqlite3_result_text(ctx, msg, -1, SQLITE_TRANSIENT);
+        sqlite3_free(msg);
+      }else{
+        doltliteVcResultError(ctx, db, "out of memory");
+      }
+    }
+  }
+  doltliteCredsFree(cred);
+}
+
 static void doltCredsFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
   sqlite3 *db = sqlite3_context_db_handle(ctx);
   const char *action = "list";
@@ -587855,10 +588946,21 @@ static void doltCredsFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
     action = (const char*)sqlite3_value_text(argv[0]);
   }
 
-  if( strcmp(action, "list")==0 ){
+  if( strcmp(action, "use")==0 ){
+    doltCredsUseFunc(ctx, argc-1, argv+1);
+    return;
+  }else if( strcmp(action, "import")==0 ){
+    doltCredsImportFunc(ctx, argc-1, argv+1);
+    return;
+  }else if( strcmp(action, "bind")==0 ){
+    doltCredsBindFunc(ctx, argc-1, argv+1);
+    return;
+  }
+  if( strcmp(action, "list")==0 || strcmp(action, "ls")==0 ){
     char **kids = 0;
     int n = 0, i;
-    char *msg;
+    char *msg, *activeKid = 0;
+    DoltliteCreds *active = 0;
     if( doltliteCredsList(0, &kids, &n)!=0 ){
       doltliteVcResultError(ctx, db, "failed to read ~/.doltlite/creds");
       return;
@@ -587869,9 +588971,13 @@ static void doltCredsFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
       doltliteCredsFreeList(kids, n);
       return;
     }
+    active = credsSqlCurrent(db);
+    if( active ) activeKid = doltliteCredsKid(active);
+    doltliteCredsFree(active);
     msg = sqlite3_mprintf("%d credential(s):", n);
     for(i=0; i<n && msg; i++){
-      char *nx = sqlite3_mprintf("%s\n  %s", msg, kids[i]);
+      char *nx = sqlite3_mprintf("%s\n%s %s", msg,
+          activeKid && strcmp(activeKid, kids[i])==0 ? "*" : " ", kids[i]);
       sqlite3_free(msg);
       msg = nx;
     }
@@ -587881,6 +588987,7 @@ static void doltCredsFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
     }else{
       doltliteVcResultError(ctx, db, "out of memory");
     }
+    sqlite3_free(activeKid);
     doltliteCredsFreeList(kids, n);
   }else if( strcmp(action, "rm")==0 || strcmp(action, "remove")==0 ){
     const char *kid;
@@ -587901,43 +589008,7 @@ static void doltCredsFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
       }
     }
   }else if( strcmp(action, "export")==0 ){
-    const char *kid;
-    DoltliteCreds *cred = 0;
-    if( argc<2 || argc>3 || !sqlite3_value_text(argv[1]) ||
-        (argc==3 && !sqlite3_value_text(argv[2])) ){
-      doltliteVcResultError(ctx, db,
-          "usage: dolt_creds('export', <kid> [, <authorized-keys-dir>])");
-      return;
-    }
-    kid = (const char*)sqlite3_value_text(argv[1]);
-    if( doltliteCredsLoad(0, kid, &cred)!=0 ){
-      doltliteVcResultError(ctx, db, "no such credential");
-      return;
-    }
-    if( argc==2 ){
-      char *json = doltliteCredsToPublicJwk(cred);
-      if( json ){
-        sqlite3_result_text(ctx, json, -1, SQLITE_TRANSIENT);
-        sqlite3_free(json);
-      }else{
-        doltliteVcResultError(ctx, db, "out of memory");
-      }
-    }else{
-      const char *dir = (const char*)sqlite3_value_text(argv[2]);
-      if( doltliteCredsSavePublic(cred, dir)!=0 ){
-        doltliteVcResultError(ctx, db, "failed to export public credential");
-      }else{
-        char *msg = sqlite3_mprintf(
-            "Exported public credential %s to %s", kid, dir);
-        if( msg ){
-          sqlite3_result_text(ctx, msg, -1, SQLITE_TRANSIENT);
-          sqlite3_free(msg);
-        }else{
-          doltliteVcResultError(ctx, db, "out of memory");
-        }
-      }
-    }
-    doltliteCredsFree(cred);
+    doltCredsExportFunc(ctx, argc-1, argv+1);
   }else{
     doltliteVcResultError(ctx, db,
         "usage: dolt_creds(['list'] | 'rm', <kid> | 'export', <kid> "
@@ -587963,6 +589034,12 @@ int doltliteRemoteSqlRegister(sqlite3 *db){
                                  doltCredsNewFunc);
   if( rc==SQLITE_OK ) rc = doltliteCreateCommandFunc(db, "dolt_creds", -1,
                                  doltCredsFunc);
+  if( rc==SQLITE_OK ) rc = doltliteCreateCommandFunc(db, "dolt_creds_use", -1, doltCredsUseFunc);
+  if( rc==SQLITE_OK ) rc = doltliteCreateCommandFunc(db, "dolt_creds_import", -1, doltCredsImportFunc);
+  if( rc==SQLITE_OK ) rc = doltliteCreateCommandFunc(db, "dolt_creds_rm", -1, doltCredsRmFunc);
+  if( rc==SQLITE_OK ) rc = doltliteCreateCommandFunc(db, "dolt_creds_export", -1, doltCredsExportFunc);
+  if( rc==SQLITE_OK ) rc = doltliteCreateCommandFunc(db, "dolt_creds_bind", -1, doltCredsBindFunc);
+  if( rc==SQLITE_OK ) rc = doltliteCreateShieldedModule(db, "dolt_creds_ls", &credsModule, 0);
 #endif
   if( rc==SQLITE_OK ) rc = doltliteCreateShieldedModule(db, "dolt_remotes", &remotesModule, 0);
   return rc;
@@ -588034,6 +589111,7 @@ struct HttpRemote {
   int port;
   int useTls;
   int timeoutMs;
+  i64 retryDeadlineMs;
   char *zBasePath;
 #if !defined(__EMSCRIPTEN__)
   HttpConn *pConn;
@@ -588042,6 +589120,9 @@ struct HttpRemote {
 #ifdef DOLTLITE_HAVE_AUTH
   DoltliteCreds *cred;
   char *zAudience;      /* JWT audience */
+  sqlite3 *db;
+  int authState;
+  int authResolved;
 #endif
 
   u8 *pUploadBuf;
@@ -588056,6 +589137,8 @@ struct HttpRemote {
   int bPushForce;
   char *zLastError;
 };
+
+static int httpPrepareAuth(HttpRemote*, const char*, const char*);
 
 #define HTTP_RESP_MAX_BYTES ((i64)1024 * 1024 * 1024)
 #define HTTP_HEADER_MAX_BYTES ((i64)64 * 1024)
@@ -588269,17 +589352,20 @@ static int httpHeaderNameEquals(
 #define httpConnOpen(H,P,T,M) doltliteConnOpenTimeout((H),(P),(T),(M))
 #define httpConnWriteAll(C,B,N) doltliteConnWriteAll((C),(B),(N))
 #define httpConnRead(C,B,N) doltliteConnRead((C),(B),(N))
-#define httpConnSetTimeout(C,M) doltliteConnSetTimeout((C),(M))
+#define httpConnSetTimeout(C,M,I) doltliteConnSetIdleTimeout((C),(M),(I))
+#define httpConnTimeoutRemaining(C) doltliteConnTimeoutRemaining((C))
 #define httpConnClose(C) doltliteConnClose((C))
 #else
 struct HttpConn {
   int fd;
   i64 deadlineMs;
+  int timeoutMs;
+  int timedOut;
 };
 
 static int httpConnApplyDeadline(HttpConn *pConn){
   i64 remaining = pConn->deadlineMs - doltliteMonotonicMs();
-  if( remaining<=0 ) return 1;
+  if( remaining<=0 ){ pConn->timedOut = 1; return 1; }
   if( remaining>0x7fffffff ) remaining = 0x7fffffff;
   return doltliteSocketSetTimeout(pConn->fd, (int)remaining);
 }
@@ -588311,6 +589397,7 @@ static HttpConn *httpConnOpen(
     doltliteCloseSocket(fd);
     return 0;
   }
+  memset(pConn, 0, sizeof(*pConn));
   pConn->fd = fd;
   pConn->deadlineMs = deadlineMs;
   if( httpConnApplyDeadline(pConn)!=0 ){
@@ -588321,9 +589408,11 @@ static HttpConn *httpConnOpen(
   return pConn;
 }
 
-static int httpConnSetTimeout(HttpConn *pConn, int timeoutMs){
-  pConn->deadlineMs = timeoutMs>0 ? doltliteMonotonicMs() + timeoutMs : 0;
-  if( timeoutMs<=0 ) return doltliteSocketSetTimeout(pConn->fd, 0);
+static int httpConnSetTimeout(HttpConn *pConn, int timeoutMs, int initialMs){
+  pConn->timeoutMs = timeoutMs;
+  pConn->timedOut = 0;
+  pConn->deadlineMs = initialMs>0 ? doltliteMonotonicMs() + initialMs : 0;
+  if( initialMs<=0 ) return doltliteSocketSetTimeout(pConn->fd, 0);
   return httpConnApplyDeadline(pConn);
 }
 
@@ -588338,15 +589427,29 @@ static int httpConnWriteAll(HttpConn *pConn, const void *pBuf, int nBuf){
     int n;
     if( httpConnApplyDeadline(pConn)!=0 ) return 1;
     n = send(pConn->fd, z+nSent, nBuf-nSent, flags);
-    if( n<=0 ) return 1;
+    if( n<=0 ){
+      pConn->timedOut = n<0 && doltliteSocketTimedOut();
+      return 1;
+    }
+    if( pConn->timeoutMs ) pConn->deadlineMs = doltliteMonotonicMs() + pConn->timeoutMs;
     nSent += n;
   }
   return 0;
 }
 
 static int httpConnRead(HttpConn *pConn, void *pBuf, int nBuf){
+  int n;
   if( httpConnApplyDeadline(pConn)!=0 ) return -1;
-  return recv(pConn->fd, (char*)pBuf, nBuf, 0);
+  n = recv(pConn->fd, (char*)pBuf, nBuf, 0);
+  if( n>0 && pConn->timeoutMs ) pConn->deadlineMs = doltliteMonotonicMs() + pConn->timeoutMs;
+  else if( n<0 ) pConn->timedOut = doltliteSocketTimedOut();
+  return n;
+}
+
+static int httpConnTimeoutRemaining(HttpConn *pConn){
+  i64 remaining = pConn->deadlineMs - doltliteMonotonicMs();
+  if( pConn->timedOut || remaining<=0 ) return 0;
+  return remaining>0x7fffffff ? 0x7fffffff : (int)remaining;
 }
 
 static void httpConnClose(HttpConn *pConn){
@@ -588805,6 +589908,8 @@ static int httpRequest(
   *ppResp = 0;
   *pnResp = 0;
   httpClearLastError(p);
+  status = httpPrepareAuth(p, zMethod, zPath);
+  if( status!=SQLITE_OK ) return status;
 
   if( nBody > 0x7fffffff ) return SQLITE_TOOBIG;
 
@@ -588819,6 +589924,7 @@ static int httpRequest(
       zAuth = sqlite3_mprintf("Bearer %s", jwt);
     }
     if( jwt ) sqlite3_free(jwt);
+    if( !zAuth ){ sqlite3_free(zUrl); return SQLITE_NOMEM; }
   }
 #endif
 
@@ -588852,20 +589958,28 @@ static void httpDisconnect(HttpRemote *p){
   p->pConn = 0;
 }
 
-static int httpRemainingTimeout(i64 deadlineMs){
-  i64 remaining = deadlineMs - doltliteMonotonicMs();
-  if( remaining<=0 ) return 0;
-  if( remaining>0x7fffffff ) remaining = 0x7fffffff;
-  return (int)remaining;
+static int httpTimeout(HttpRemote *p, const char *phase){
+  char *message = sqlite3_mprintf("remote %s timed out after %d ms without progress",
+                                 phase, p->timeoutMs);
+  httpSetLastError(p, message);
+  sqlite3_free(message);
+  return SQLITE_ERROR;
 }
 
-/* The peer hung up, or a socket read or write failed. That is a network
-** failure: keep a message, and a result code, that name the network. */
-static int httpConnectionLost(HttpRemote *p, int *pTransportError){
-  *pTransportError = 1;
+static int httpConnectionLost(HttpRemote *p, int *pTransportError, const char *phase){
+  int remaining = p->pConn ? httpConnTimeoutRemaining(p->pConn) : 0;
+  *pTransportError = remaining>0;
+  p->retryDeadlineMs = doltliteMonotonicMs() + remaining;
   httpDisconnect(p);
+  if( !remaining ) return httpTimeout(p, phase);
   httpSetLastError(p, "connection to remote lost");
   return SQLITE_ERROR;
+}
+
+static int httpRetryTimeout(HttpRemote *p, i64 deadlineMs){
+  i64 remaining = deadlineMs ? deadlineMs-doltliteMonotonicMs() : p->timeoutMs;
+  if( remaining<=0 ) return 0;
+  return remaining>p->timeoutMs ? p->timeoutMs : (int)remaining;
 }
 
 static int httpRequestMayRetry(const char *zMethod, const char *zPath){
@@ -588873,7 +589987,8 @@ static int httpRequestMayRetry(const char *zMethod, const char *zPath){
   if( sqlite3_stricmp(zMethod, "GET")==0 ) return 1;
   if( sqlite3_stricmp(zMethod, "POST")!=0 ) return 0;
   return (nPath>=11 && strcmp(zPath+nPath-11, "/get-chunks")==0)
-      || (nPath>=11 && strcmp(zPath+nPath-11, "/has-chunks")==0);
+      || (nPath>=11 && strcmp(zPath+nPath-11, "/has-chunks")==0)
+      || (nPath>=7 && strcmp(zPath+nPath-7, "/chunks")==0);
 }
 
 static int httpRequestOnce(
@@ -588883,8 +589998,7 @@ static int httpRequestOnce(
   const u8 *pBody, i64 nBody,
   int *pStatus,
   u8 **ppResp, int *pnResp,
-  i64 deadlineMs,
-  int *pWasReused,
+  i64 retryDeadlineMs,
   int *pTransportError
 ){
   char *zAuth = 0;
@@ -588892,33 +590006,35 @@ static int httpRequestOnce(
   u8 *pRaw = 0;
   int nRaw = 0;
   int closeConnection = 0;
-  int timeoutMs;
+  i64 connectStart;
+  int timeoutMs = httpRetryTimeout(p, retryDeadlineMs);
   int rc = SQLITE_ERROR;
 
   *pStatus = 0;
   *ppResp = 0;
   *pnResp = 0;
-  *pWasReused = p->pConn!=0;
   *pTransportError = 0;
+  if( !timeoutMs ){
+    httpDisconnect(p);
+    return httpTimeout(p, "request");
+  }
 
-  timeoutMs = httpRemainingTimeout(deadlineMs);
-  if( timeoutMs<=0 ){
-    *pTransportError = 1;
-    httpDisconnect(p);
-    return SQLITE_IOERR;
-  }
   if( !p->pConn ){
+    connectStart = doltliteMonotonicMs();
     p->pConn = httpConnOpen(p->zHost, p->port, p->useTls, timeoutMs);
+    if( !p->pConn ){
+      httpSetLastError(p, doltliteMonotonicMs()-connectStart>=timeoutMs
+          ? "connection to remote timed out" : "could not connect to remote");
+      return SQLITE_ERROR;
+    }
   }
-  if( !p->pConn ){
-    httpSetLastError(p, "could not connect to remote");
-    return SQLITE_ERROR;
-  }
-  timeoutMs = httpRemainingTimeout(deadlineMs);
-  if( timeoutMs<=0 || httpConnSetTimeout(p->pConn, timeoutMs)!=0 ){
-    *pTransportError = 1;
+  timeoutMs = httpRetryTimeout(p, retryDeadlineMs);
+  if( !timeoutMs ){
     httpDisconnect(p);
-    return SQLITE_IOERR;
+    return httpTimeout(p, "request");
+  }
+  if( httpConnSetTimeout(p->pConn, retryDeadlineMs ? 0 : p->timeoutMs, timeoutMs)!=0 ){
+    return httpConnectionLost(p, pTransportError, "request");
   }
 
 #ifdef DOLTLITE_HAVE_AUTH
@@ -588928,6 +590044,7 @@ static int httpRequestOnce(
       zAuth = sqlite3_mprintf("Authorization: Bearer %s\r\n", jwt);
     }
     if( jwt ) sqlite3_free(jwt);
+    if( !zAuth ) return SQLITE_NOMEM;
   }
 #endif
 
@@ -588959,7 +590076,7 @@ static int httpRequestOnce(
      ? SQLITE_IOERR : SQLITE_OK;
   sqlite3_free(zHdr);
   if( rc != SQLITE_OK ){
-    return httpConnectionLost(p, pTransportError);
+    return httpConnectionLost(p, pTransportError, "upload");
   }
   if( pBody && nBody > 0 ){
     i64 off = 0;
@@ -588967,17 +590084,27 @@ static int httpRequestOnce(
       i64 nRemain = nBody - off;
       int nWrite = nRemain>0x7fffffff ? 0x7fffffff : (int)nRemain;
       if( httpConnWriteAll(p->pConn, pBody+off, nWrite) ){
-        return httpConnectionLost(p, pTransportError);
+        return httpConnectionLost(p, pTransportError, "upload");
       }
       off += nWrite;
     }
   }
 
+  if( retryDeadlineMs ){
+    timeoutMs = httpRetryTimeout(p, retryDeadlineMs);
+    if( !timeoutMs ){
+      httpDisconnect(p);
+      return httpTimeout(p, "request");
+    }
+    if( httpConnSetTimeout(p->pConn, p->timeoutMs, timeoutMs)!=0 ){
+      return httpConnectionLost(p, pTransportError, "response");
+    }
+  }
   rc = readHttpResponse(p->pConn, &pRaw, &nRaw, &closeConnection,
                         pTransportError);
   if( rc != SQLITE_OK ){
     if( *pTransportError && (rc==SQLITE_IOERR || rc==SQLITE_PROTOCOL) ){
-      return httpConnectionLost(p, pTransportError);
+      return httpConnectionLost(p, pTransportError, "response");
     }
     httpDisconnect(p);
     return rc;
@@ -588997,23 +590124,27 @@ static int httpRequest(
   int *pStatus,
   u8 **ppResp, int *pnResp
 ){
-  int wasReused = 0;
   int transportError = 0;
-  i64 deadlineMs = doltliteMonotonicMs() + p->timeoutMs;
   int rc;
 
   httpClearLastError(p);
+  *pStatus = 0;
+  *ppResp = 0;
+  *pnResp = 0;
+  rc = httpPrepareAuth(p, zMethod, zPath);
+  if( rc!=SQLITE_OK ) return rc;
   rc = httpRequestOnce(p, zMethod, zPath, pBody, nBody,
-                       pStatus, ppResp, pnResp,
-                       deadlineMs,
-                       &wasReused, &transportError);
-  if( rc!=SQLITE_OK && wasReused && transportError
+                       pStatus, ppResp, pnResp, 0,
+                       &transportError);
+  if( rc!=SQLITE_OK && transportError
    && httpRequestMayRetry(zMethod, zPath) ){
+    int nPath = (int)strlen(zPath);
+    i64 deadline = sqlite3_stricmp(zMethod, "POST")==0
+        && nPath>=7 && strcmp(zPath+nPath-7, "/chunks")==0 ? 0 : p->retryDeadlineMs;
     httpClearLastError(p);
     rc = httpRequestOnce(p, zMethod, zPath, pBody, nBody,
-                         pStatus, ppResp, pnResp,
-                         deadlineMs,
-                         &wasReused, &transportError);
+                         pStatus, ppResp, pnResp, deadline,
+                         &transportError);
   }
   return rc;
 }
@@ -589520,37 +590651,63 @@ static void httpClose(DoltliteRemote *pRemote){
   sqlite3_free(p);
 }
 
+static int httpPrepareAuth(HttpRemote *p, const char *method, const char *path){
 #ifdef DOLTLITE_HAVE_AUTH
-static void httpResolveCreds(HttpRemote *p){
-  char *dir = doltliteCredsDir();
-  const char *kid = getenv("DOLTLITE_CREDS_KID");
-  DoltliteCreds *cred = 0;
-  if( dir ){
-    if( kid && *kid ){
-      doltliteCredsLoad(dir, kid, &cred);
-    }else{
-      doltliteCredsLoadDefault(dir, &cred);
+  const char *selected = 0;
+  const char *aud;
+  char *url, *error = 0;
+  int nPath = (int)strlen(path);
+  int readOnly = strcmp(method, "GET")==0
+      || (nPath>=11 && strcmp(path+nPath-11, "/get-chunks")==0)
+      || (nPath>=11 && strcmp(path+nPath-11, "/has-chunks")==0);
+  if( !p->useTls ) return SQLITE_OK;
+  if( !p->authResolved ){
+    if( p->db ) selected = sqlite3_get_clientdata(p->db, DOLTLITE_CREDS_SESSION);
+    doltliteCredsFree(p->cred);
+    p->cred = 0;
+    sqlite3_free(p->zAudience);
+    p->zAudience = 0;
+    url = sqlite3_mprintf("https://%s:%d%s", p->zHost, p->port, p->zBasePath);
+    if( !url ) return SQLITE_NOMEM;
+    p->authState = doltliteCredsResolve(0, selected, url, &p->cred, 0, &error);
+    sqlite3_free(url);
+    if( p->authState==DOLTLITE_CREDS_ERROR ){
+      httpSetLastError(p, error ? error : "failed to resolve credentials");
+      sqlite3_free(error);
+      return SQLITE_AUTH;
     }
-    sqlite3_free(dir);
+    sqlite3_free(error);
+    if( p->cred ){
+      aud = getenv("DOLT_OVERRIDE_GRPC_JWT_AUDIENCE");
+      if( aud && *aud ) p->zAudience = sqlite3_mprintf("%s", aud);
+      else if( strncmp(p->zHost, "doltliteremoteapi.", 18)==0 ){
+        p->zAudience = sqlite3_mprintf("doltremoteapi.%s", p->zHost+18);
+      }else p->zAudience = sqlite3_mprintf("%s", p->zHost);
+      if( !p->zAudience ) return SQLITE_NOMEM;
+    }
+    p->authResolved = 1;
   }
-  if( cred ){
-    const char *aud = getenv("DOLT_OVERRIDE_GRPC_JWT_AUDIENCE");
-    if( aud && *aud ){
-      p->zAudience = sqlite3_mprintf("%s", aud);
-    }else if( strncmp(p->zHost, "doltliteremoteapi.", 18)==0 ){
-      /* doltremoteapi audience for dolthub. */
-      p->zAudience = sqlite3_mprintf("doltremoteapi.%s", p->zHost + 18);
-    }else{
-      p->zAudience = sqlite3_mprintf("%s", p->zHost);
-    }
-    if( p->zAudience ){
-      p->cred = cred;
-    }else{
-      doltliteCredsFree(cred);
-    }
+  if( p->authState==DOLTLITE_CREDS_NONE && !readOnly ){
+    httpSetLastError(p, "no credential selected; use dolt_creds_use() or explicitly select 'anonymous'");
+    return SQLITE_AUTH;
   }
-}
+#else
+  (void)p; (void)method; (void)path;
 #endif
+  return SQLITE_OK;
+}
+
+void doltliteHttpRemoteSetConnection(DoltliteRemote *remote, sqlite3 *db){
+#ifdef DOLTLITE_HAVE_AUTH
+  if( remote && remote->xClose==httpClose ){
+    HttpRemote *p = (HttpRemote*)remote;
+    p->db = db;
+    p->authResolved = 0;
+  }
+#else
+  (void)remote; (void)db;
+#endif
+}
 
 DoltliteRemote *doltliteHttpRemoteOpen(const char *zUrl){
   HttpRemote *p;
@@ -589661,11 +590818,6 @@ DoltliteRemote *doltliteHttpRemoteOpen(const char *zUrl){
   p->zBasePath[nBasePath] = '\0';
 
   p->useTls = useTls;
-#ifdef DOLTLITE_HAVE_AUTH
-  if( useTls ){
-    httpResolveCreds(p);
-  }
-#endif
 
   p->base.xGetChunk = httpGetChunk;
   p->base.xPutChunk = httpPutChunk;

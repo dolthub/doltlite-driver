@@ -68,12 +68,14 @@ static unsigned char *dl_source_bytes(const void *p, int n) {
 import "C"
 
 import (
+	"context"
 	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"fmt"
 	"io"
 	"runtime/cgo"
+	"strings"
 	"sync"
 	"unsafe"
 )
@@ -334,34 +336,135 @@ func (c *conn) Close() error {
 	return nil
 }
 
+var (
+	errNoStatement = errors.New("doltlite: query contains no statement")
+	errArgCount    = errors.New("doltlite: argument count does not match the query's parameters")
+)
+
 func (c *conn) Prepare(query string) (driver.Stmt, error) {
+	s, _, err := c.prepare(query)
+	if err != nil {
+		return nil, err
+	}
+	if s == nil {
+		return nil, errNoStatement
+	}
+	return s, nil
+}
+
+// prepare compiles the first statement in query and returns the SQL after it.
+// The statement is nil when query holds no statement.
+func (c *conn) prepare(query string) (*stmt, string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
-		return nil, driver.ErrBadConn
+		return nil, "", driver.ErrBadConn
 	}
 	var st *C.sqlite3_stmt
 	var rc C.int
 	var nInput int
+	var rest string
 	if err := c.run(func() {
 		cq := C.CString(query)
 		defer C.free(unsafe.Pointer(cq))
-		rc = C.sqlite3_prepare_v2(c.db, cq, -1, &st, nil)
+		var tail *C.char
+		rc = C.sqlite3_prepare_v2(c.db, cq, -1, &st, &tail)
 		if rc == C.SQLITE_OK && st != nil {
 			nInput = int(C.sqlite3_bind_parameter_count(st))
+			rest = query[uintptr(unsafe.Pointer(tail))-uintptr(unsafe.Pointer(cq)):]
 		}
 	}); err != nil {
-		return nil, driver.ErrBadConn
+		return nil, "", driver.ErrBadConn
 	}
 	if rc != C.SQLITE_OK {
-		return nil, c.err(rc)
+		return nil, "", c.err(rc)
 	}
 	if st == nil {
-		return nil, errors.New("doltlite: query contains no statement")
+		return nil, "", nil
 	}
 	s := &stmt{c: c, st: st, nInput: nInput}
 	c.stmts[s] = struct{}{}
-	return s, nil
+	return s, rest, nil
+}
+
+// tailHasNoStatement reports whether rest, the uncompiled tail after a
+// prepared statement, holds only semicolons, whitespace, and comments.
+// sqlite3_prepare_v2 stops at the first statement, so those leftovers are
+// still in rest and are not another statement. The parameter count has to
+// be decided before this statement runs.
+func tailHasNoStatement(rest string) bool {
+	for i := 0; i < len(rest); {
+		switch rest[i] {
+		case ' ', '\t', '\n', '\r', '\f', '\v', ';':
+			i++
+		case '-':
+			if i+1 >= len(rest) || rest[i+1] != '-' {
+				return false
+			}
+			i += 2
+			for i < len(rest) && rest[i] != '\n' {
+				i++
+			}
+		case '/':
+			if i+1 >= len(rest) || rest[i+1] != '*' {
+				return false
+			}
+			i += 2
+			end := strings.Index(rest[i:], "*/")
+			if end < 0 {
+				return true
+			}
+			i += end + 2
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// ExecContext runs every statement in query in order, as other SQLite drivers
+// for database/sql do, and binds args to their parameters in sequence. The
+// result is the last statement's.
+func (c *conn) ExecContext(ctx context.Context, query string, named []driver.NamedValue) (driver.Result, error) {
+	args := make([]driver.Value, len(named))
+	for i, nv := range named {
+		if nv.Name != "" {
+			return nil, errors.New("doltlite: named arguments are not supported")
+		}
+		args[i] = nv.Value
+	}
+	var res driver.Result
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		s, rest, err := c.prepare(query)
+		if err != nil {
+			return nil, err
+		}
+		if s == nil {
+			break
+		}
+		last := tailHasNoStatement(rest)
+		if s.nInput > len(args) || (last && s.nInput != len(args)) {
+			s.Close()
+			return nil, errArgCount
+		}
+		res, err = s.Exec(args[:s.nInput])
+		s.Close()
+		if err != nil {
+			return nil, err
+		}
+		args = args[s.nInput:]
+		query = rest
+	}
+	if res == nil {
+		return nil, errNoStatement
+	}
+	if len(args) > 0 {
+		return nil, errArgCount
+	}
+	return res, nil
 }
 
 // Begin starts a write transaction. IMMEDIATE, not the default DEFERRED: a
@@ -505,7 +608,7 @@ func (s *stmt) Query(args []driver.Value) (driver.Rows, error) {
 	if s.closed {
 		return nil, driver.ErrBadConn
 	}
-	var cols []string
+	var cols, types []string
 	var bindErr error
 	if err := s.c.run(func() {
 		if bindErr = s.bind(args); bindErr != nil {
@@ -513,8 +616,10 @@ func (s *stmt) Query(args []driver.Value) (driver.Rows, error) {
 		}
 		n := int(C.sqlite3_column_count(s.st))
 		cols = make([]string, n)
+		types = make([]string, n)
 		for i := 0; i < n; i++ {
 			cols[i] = C.GoString(C.sqlite3_column_name(s.st, C.int(i)))
+			types[i] = strings.ToUpper(C.GoString(C.sqlite3_column_decltype(s.st, C.int(i))))
 		}
 	}); err != nil {
 		return nil, driver.ErrBadConn
@@ -522,7 +627,64 @@ func (s *stmt) Query(args []driver.Value) (driver.Rows, error) {
 	if bindErr != nil {
 		return nil, bindErr
 	}
-	return &rows{s: s, cols: cols}, nil
+	return &rows{s: s, cols: cols, types: types}, nil
+}
+
+// ColumnMetadata describes one result column of a query. Database, Table and
+// Column name the table column whose values the result column returns, and
+// DeclType is that column's declared type as written in CREATE TABLE. All four
+// are empty for a column computed from an expression.
+type ColumnMetadata struct {
+	Name     string
+	DeclType string
+	Database string
+	Table    string
+	Column   string
+}
+
+// ColumnDescriber is implemented by this driver's connections. Reach it with
+// sql.Conn.Raw:
+//
+//	cols, err := raw.(doltlite.ColumnDescriber).DescribeColumns(query)
+type ColumnDescriber interface {
+	DescribeColumns(query string) ([]ColumnMetadata, error)
+}
+
+// DescribeColumns compiles the first statement in query, without running it,
+// and describes its result columns. A statement that returns no rows has none.
+func (c *conn) DescribeColumns(query string) ([]ColumnMetadata, error) {
+	s, _, err := c.prepare(query)
+	if err != nil {
+		return nil, err
+	}
+	if s == nil {
+		return nil, errNoStatement
+	}
+	defer s.Close()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if s.closed {
+		return nil, driver.ErrBadConn
+	}
+	var cols []ColumnMetadata
+	if err := c.run(func() {
+		n := int(C.sqlite3_column_count(s.st))
+		cols = make([]ColumnMetadata, n)
+		for i := 0; i < n; i++ {
+			idx := C.int(i)
+			cols[i] = ColumnMetadata{
+				Name:     C.GoString(C.sqlite3_column_name(s.st, idx)),
+				DeclType: C.GoString(C.sqlite3_column_decltype(s.st, idx)),
+				Database: C.GoString(C.sqlite3_column_database_name(s.st, idx)),
+				Table:    C.GoString(C.sqlite3_column_table_name(s.st, idx)),
+				Column:   C.GoString(C.sqlite3_column_origin_name(s.st, idx)),
+			}
+		}
+	}); err != nil {
+		return nil, driver.ErrBadConn
+	}
+	return cols, nil
 }
 
 type result struct {
@@ -536,10 +698,15 @@ func (r result) RowsAffected() (int64, error) { return r.changes, nil }
 type rows struct {
 	s      *stmt
 	cols   []string
+	types  []string
 	closed bool
 }
 
 func (r *rows) Columns() []string { return r.cols }
+
+// ColumnTypeDatabaseTypeName returns the column's declared type, upper-cased,
+// or "" for a column computed from an expression.
+func (r *rows) ColumnTypeDatabaseTypeName(i int) string { return r.types[i] }
 
 func (r *rows) Close() error {
 	if r.closed {

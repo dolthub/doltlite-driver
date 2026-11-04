@@ -197,7 +197,7 @@
 # define DOLTLITE_PROLLY 1
 #endif
 #ifndef DOLTLITE_VERSION
-# define DOLTLITE_VERSION "0.51.7"
+# define DOLTLITE_VERSION "0.51.8"
 #endif
 #ifndef DOLTLITE_ENABLE_REMOTES
 # define DOLTLITE_ENABLE_REMOTES 1
@@ -23815,6 +23815,8 @@ struct ProllyHash {
 };
 
 void prollyHashCompute(const void *pData, int nData, ProllyHash *pOut);
+void prollyHashComputeMany(const u8 *const *apData, const int *anData, int n,
+                           ProllyHash *aOut);
 void prollyHashComputeZeroTail(const void *pData, int nData, sqlite3_int64 nZeroTail,
                                ProllyHash *pOut);
 
@@ -24863,6 +24865,8 @@ int chunkStoreSourceEnabled(ChunkStore *cs);
 
 int chunkStorePut(ChunkStore *cs, const u8 *pData, int nData,
                   ProllyHash *pHash);
+int chunkStorePutHashed(ChunkStore *cs, const u8 *pData, int nData,
+                        const ProllyHash *pHash);
 int chunkStorePutChecked(ChunkStore *cs, const ProllyHash *pExpected,
                          const u8 *pData, int nData);
 /* True when the staged write buffer has reached the drain threshold. */
@@ -89758,6 +89762,8 @@ int chunkStoreSourceEnabled(ChunkStore *cs);
 
 int chunkStorePut(ChunkStore *cs, const u8 *pData, int nData,
                   ProllyHash *pHash);
+int chunkStorePutHashed(ChunkStore *cs, const u8 *pData, int nData,
+                        const ProllyHash *pHash);
 int chunkStorePutChecked(ChunkStore *cs, const ProllyHash *pExpected,
                          const u8 *pData, int nData);
 /* True when the staged write buffer has reached the drain threshold. */
@@ -480956,6 +480962,7 @@ int prollyLoadNode(ChunkStore *pStore, ProllyCache *pCache,
 
 typedef struct ProllyChunker ProllyChunker;
 typedef struct ProllyChunkerLevel ProllyChunkerLevel;
+typedef struct ProllyChunkerLeaf ProllyChunkerLeaf;
 
 struct ProllyChunkerLevel {
   ProllyNodeBuilder builder;
@@ -480964,6 +480971,15 @@ struct ProllyChunkerLevel {
   u64 subtreeCount;
 };
 
+struct ProllyChunkerLeaf {
+  u8 *pData;
+  int nData;
+  int iItem;
+  u8 bCache;
+};
+
+/* Leaves whose hashes are still zero in the level-1 builder. They are hashed
+** together, SIMD lanes filled across nodes, before that builder is read. */
 struct ProllyChunker {
   ChunkStore *pStore;
   ProllyCache *pCache;
@@ -480971,6 +480987,9 @@ struct ProllyChunker {
   int nLevels;
   ProllyChunkerLevel aLevel[PROLLY_CURSOR_MAX_DEPTH];
   ProllyHash root;
+  ProllyChunkerLeaf *aLeaf;
+  int nLeaf;
+  int nLeafAlloc;
 };
 
 int prollyChunkerInit(ProllyChunker *ch, ChunkStore *pStore, u8 flags);
@@ -480996,6 +481015,10 @@ int prollyChunkerAddAtLevelWithCount(ProllyChunker *ch, int level,
                                      const u8 *pKey, int nKey,
                                      const u8 *pVal, int nVal,
                                      u64 subtreeCount);
+
+int prollyChunkerAddLeafNode(ProllyChunker *ch,
+                             const u8 *pKey, int nKey,
+                             u8 *pData, int nData, u64 nItems);
 
 int prollyChunkerLevelsBelowEmpty(const ProllyChunker *ch, int level);
 
@@ -481083,6 +481106,10 @@ BLAKE3_API void blake3_hasher_reset(blake3_hasher *self);
 ** the whole buffer, but takes the wide compression path. */
 BLAKE3_API void blake3_hash_oneshot(const void *input, size_t input_len,
                                     uint8_t *out, size_t out_len);
+/* DOLTLITE addition; see blake3.c. out receives n 32-byte hashes. */
+BLAKE3_API void blake3_hash_oneshot_many(const void *const *inputs,
+                                         const size_t *input_lens, size_t n,
+                                         uint8_t *out);
 
 #if 0
 }
@@ -481096,6 +481123,20 @@ BLAKE3_API void blake3_hash_oneshot(const void *input, size_t input_len,
 
 void prollyHashCompute(const void *pData, int nData, ProllyHash *pOut){
   blake3_hash_oneshot(pData, (size_t)nData, pOut->data, PROLLY_HASH_SIZE);
+}
+
+void prollyHashComputeMany(const u8 *const *apData, const int *anData, int n,
+                           ProllyHash *aOut){
+  size_t aLen[16];
+  u8 aBuf[16*32];
+  int i, j;
+  for(i=0; i<n; i+=16){
+    int k = n-i < 16 ? n-i : 16;
+    for(j=0; j<k; j++) aLen[j] = (size_t)anData[i+j];
+    blake3_hash_oneshot_many((const void *const*)&apData[i], aLen, (size_t)k,
+                             aBuf);
+    for(j=0; j<k; j++) memcpy(aOut[i+j].data, &aBuf[j*32], PROLLY_HASH_SIZE);
+  }
 }
 
 /* Hash pData[0..nData) plus nZeroTail zeros without materializing them. */
@@ -482127,6 +482168,124 @@ void blake3_hash_oneshot(const void *input, size_t input_len, uint8_t *out,
     output = parent_output(cv_pair, IV, 0);
   }
   output_root_bytes(&output, 0, out, out_len);
+}
+/* DOLTLITE: hash many buffers at once, 32-byte output each. A single prolly
+** node has about four chunks, too few to fill an 8- or 16-lane SIMD batch, so
+** chunk j of every buffer in a group goes through one hash_many() call. Each
+** buffer's chunk CVs then fold through the same lazy-merge stack the
+** incremental hasher uses, so output matches blake3_hash_oneshot(). */
+#define DOLTLITE_MANY_GROUP 16
+#define DOLTLITE_MANY_MAX_CHUNKS 32
+#define DOLTLITE_MANY_STACK 6
+
+typedef struct {
+  uint8_t cv[DOLTLITE_MANY_STACK][BLAKE3_OUT_LEN];
+  size_t n;
+} doltlite_cv_stack;
+
+INLINE void doltlite_push_cv(doltlite_cv_stack *st, const uint8_t cv[32],
+                             uint64_t chunk_counter) {
+  size_t post = (size_t)popcnt(chunk_counter);
+  while (st->n > post) {
+    output_t output = parent_output(st->cv[st->n - 2], IV, 0);
+    output_chaining_value(&output, st->cv[st->n - 2]);
+    st->n--;
+  }
+  memcpy(st->cv[st->n++], cv, BLAKE3_OUT_LEN);
+}
+
+static void doltlite_hash_group(const uint8_t *const *inputs,
+                                const size_t *lens, size_t n, uint8_t *out) {
+  doltlite_cv_stack st[DOLTLITE_MANY_GROUP];
+  const uint8_t *batch[DOLTLITE_MANY_GROUP];
+  size_t who[DOLTLITE_MANY_GROUP];
+  uint8_t cvs[DOLTLITE_MANY_GROUP * BLAKE3_OUT_LEN];
+  size_t max_len = 0;
+  size_t i, j;
+
+  for (i = 0; i < n; i++) {
+    st[i].n = 0;
+    if (lens[i] > max_len) max_len = lens[i];
+  }
+  for (j = 0; j * BLAKE3_CHUNK_LEN < max_len; j++) {
+    size_t off = j * BLAKE3_CHUNK_LEN;
+    size_t k = 0;
+    for (i = 0; i < n; i++) {
+      if (off >= lens[i]) continue;
+      if (lens[i] - off >= BLAKE3_CHUNK_LEN) {
+        batch[k] = inputs[i] + off;
+        who[k++] = i;
+      } else {
+        blake3_chunk_state chunk;
+        output_t output;
+        uint8_t cv[BLAKE3_OUT_LEN];
+        chunk_state_init(&chunk, IV, 0);
+        chunk.chunk_counter = j;
+        chunk_state_update(&chunk, inputs[i] + off, lens[i] - off);
+        output = chunk_state_output(&chunk);
+        output_chaining_value(&output, cv);
+        doltlite_push_cv(&st[i], cv, j);
+      }
+    }
+    if (k > 0) {
+      blake3_hash_many(batch, k, BLAKE3_CHUNK_LEN / BLAKE3_BLOCK_LEN, IV, j,
+                       false, 0, CHUNK_START, CHUNK_END, cvs);
+      for (i = 0; i < k; i++) {
+        doltlite_push_cv(&st[who[i]], &cvs[i * BLAKE3_OUT_LEN], j);
+      }
+    }
+  }
+  for (i = 0; i < n; i++) {
+    size_t r = st[i].n - 2;
+    output_t output = parent_output(st[i].cv[r], IV, 0);
+    while (r > 0) {
+      uint8_t block[BLAKE3_BLOCK_LEN];
+      r--;
+      memcpy(block, st[i].cv[r], BLAKE3_OUT_LEN);
+      output_chaining_value(&output, &block[BLAKE3_OUT_LEN]);
+      output = parent_output(block, IV, 0);
+    }
+    output_root_bytes(&output, 0, out + i * BLAKE3_OUT_LEN, BLAKE3_OUT_LEN);
+  }
+}
+
+void blake3_hash_oneshot_many(const void *const *inputs,
+                              const size_t *input_lens, size_t n,
+                              uint8_t *out) {
+  const uint8_t *group[DOLTLITE_MANY_GROUP];
+  size_t lens[DOLTLITE_MANY_GROUP];
+  size_t at[DOLTLITE_MANY_GROUP];
+  uint8_t hashes[DOLTLITE_MANY_GROUP * BLAKE3_OUT_LEN];
+  size_t k = 0;
+  size_t i, q;
+
+  for (i = 0; i < n; i++) {
+    size_t len = input_lens[i];
+    if (len <= BLAKE3_CHUNK_LEN
+     || len > DOLTLITE_MANY_MAX_CHUNKS * BLAKE3_CHUNK_LEN) {
+      blake3_hash_oneshot(inputs[i], len, out + i * BLAKE3_OUT_LEN,
+                          BLAKE3_OUT_LEN);
+      continue;
+    }
+    group[k] = (const uint8_t *)inputs[i];
+    lens[k] = len;
+    at[k++] = i;
+    if (k == DOLTLITE_MANY_GROUP) {
+      doltlite_hash_group(group, lens, k, hashes);
+      for (q = 0; q < k; q++) {
+        memcpy(out + at[q] * BLAKE3_OUT_LEN, &hashes[q * BLAKE3_OUT_LEN],
+               BLAKE3_OUT_LEN);
+      }
+      k = 0;
+    }
+  }
+  if (k > 0) {
+    doltlite_hash_group(group, lens, k, hashes);
+    for (q = 0; q < k; q++) {
+      memcpy(out + at[q] * BLAKE3_OUT_LEN, &hashes[q * BLAKE3_OUT_LEN],
+             BLAKE3_OUT_LEN);
+    }
+  }
 }
 #if defined(__GNUC__)
 #pragma GCC diagnostic pop
@@ -486749,15 +486908,29 @@ static int csPutChunk(
   ProllyHash *pHash,
   const ProllyHash *pExpected
 ){
-  int rc;
   ProllyHash h;
 
   if( cs->notADatabase ) return SQLITE_NOTADB;
   if( nData<0 ) return SQLITE_TOOBIG;
   prollyHashCompute(pData, nData, &h);
-  prollyStatAdd(cs->pStats, nHashBytes, (u64)nData);
   if( pExpected && prollyHashCompare(&h, pExpected)!=0 ) return SQLITE_CORRUPT;
   if( pHash ) memcpy(pHash, &h, sizeof(ProllyHash));
+  return chunkStorePutHashed(cs, pData, nData, &h);
+}
+
+/* pHash must be the content hash of pData; it is not recomputed. */
+int chunkStorePutHashed(
+  ChunkStore *cs,
+  const u8 *pData,
+  int nData,
+  const ProllyHash *pHash
+){
+  int rc;
+  ProllyHash h = *pHash;
+
+  if( cs->notADatabase ) return SQLITE_NOTADB;
+  if( nData<0 ) return SQLITE_TOOBIG;
+  prollyStatAdd(cs->pStats, nHashBytes, (u64)nData);
 
   {
     int bHas = 0;
@@ -496637,7 +496810,7 @@ static int addToLevel(ProllyChunker *ch, int level,
                       const u8 *pKey, int nKey,
                       const u8 *pVal, int nVal, i64 nZeroTail,
                       u64 childSubtreeCount);
-static int finishFlushLevel(ProllyChunker *ch, int level,
+static int finishFlushLevel(ProllyChunker *ch, int level, int bDefer,
                             ProllyHash *pHash);
 static int hasPendingAncestorLevels(const ProllyChunker *ch, int level);
 static int finishPropagateLevel(ProllyChunker *ch, int level);
@@ -496688,7 +496861,7 @@ static int flushLevel(ProllyChunker *ch, int level){
   builderLastKey(&pLevel->builder, &pLastKey, &nLastKey);
   flushedCount = pLevel->subtreeCount;
 
-  rc = finishFlushLevel(ch, level, &hash);
+  rc = finishFlushLevel(ch, level, 1, &hash);
   if( rc!=SQLITE_OK ) return rc;
 
   if( level + 1 >= PROLLY_CURSOR_MAX_DEPTH ){
@@ -496705,7 +496878,62 @@ static int flushLevel(ProllyChunker *ch, int level){
   return SQLITE_OK;
 }
 
-static int finishFlushLevel(ProllyChunker *ch, int level,
+static int deferLeaf(ProllyChunker *ch, u8 *pData, int nData, u8 bCache){
+  ProllyChunkerLeaf *p;
+  if( ch->nLeaf==ch->nLeafAlloc ){
+    int nNew = ch->nLeafAlloc ? ch->nLeafAlloc*2 : 64;
+    ProllyChunkerLeaf *aNew;
+    sqlite3BeginBenignMalloc();
+    aNew = sqlite3_realloc64(ch->aLeaf, (u64)nNew*sizeof(ProllyChunkerLeaf));
+    sqlite3EndBenignMalloc();
+    if( !aNew ) return SQLITE_NOMEM;
+    ch->aLeaf = aNew;
+    ch->nLeafAlloc = nNew;
+  }
+  p = &ch->aLeaf[ch->nLeaf++];
+  p->pData = pData;
+  p->nData = nData;
+  p->iItem = ch->nLevels>1 ? ch->aLevel[1].builder.nItems : 0;
+  p->bCache = bCache;
+  return SQLITE_OK;
+}
+
+static int resolveLeaves(ProllyChunker *ch){
+  ProllyNodeBuilder *b = &ch->aLevel[1].builder;
+  int rc = SQLITE_OK;
+  int i, j;
+  for(i=0; i<ch->nLeaf && rc==SQLITE_OK; i+=16){
+    const u8 *apData[16];
+    int anData[16];
+    ProllyHash aHash[16];
+    int n = ch->nLeaf-i < 16 ? ch->nLeaf-i : 16;
+    for(j=0; j<n; j++){
+      apData[j] = ch->aLeaf[i+j].pData;
+      anData[j] = ch->aLeaf[i+j].nData;
+    }
+    prollyHashComputeMany(apData, anData, n, aHash);
+    for(j=0; j<n && rc==SQLITE_OK; j++){
+      ProllyChunkerLeaf *p = &ch->aLeaf[i+j];
+      assert( p->iItem<b->nItems );
+      rc = chunkStorePutHashed(ch->pStore, p->pData, p->nData, &aHash[j]);
+      if( rc!=SQLITE_OK ) break;
+      memcpy(b->pValBuf + b->aValOff[p->iItem], aHash[j].data,
+             PROLLY_HASH_SIZE);
+      if( p->bCache && ch->pCache ){
+        ProllyCacheEntry *pEntry;
+        pEntry = prollyCachePutOwned(ch->pCache, &aHash[j], p->pData,
+                                     p->nData, &rc);
+        p->pData = 0;
+        if( pEntry ) prollyCacheRelease(ch->pCache, pEntry);
+      }
+    }
+  }
+  for(i=0; i<ch->nLeaf; i++) sqlite3_free(ch->aLeaf[i].pData);
+  ch->nLeaf = 0;
+  return rc;
+}
+
+static int finishFlushLevel(ProllyChunker *ch, int level, int bDefer,
                             ProllyHash *pHash){
   ProllyChunkerLevel *pLevel = &ch->aLevel[level];
   u8 *pData = 0;
@@ -496714,6 +496942,11 @@ static int finishFlushLevel(ProllyChunker *ch, int level,
   int rc;
 
   assert( pLevel->builder.nItems > 0 );
+
+  if( level==1 && ch->nLeaf ){
+    rc = resolveLeaves(ch);
+    if( rc!=SQLITE_OK ) return rc;
+  }
 
   rc = prollyNodeBuilderFinishSparse(&pLevel->builder, &pData, &nData,
                                      &nZeroTail);
@@ -496725,6 +496958,12 @@ static int finishFlushLevel(ProllyChunker *ch, int level,
                              nZeroTail, pHash);
     sqlite3_free(pData);
     return rc;
+  }
+
+  if( level==0 && bDefer
+   && deferLeaf(ch, pData, nData, 1)==SQLITE_OK ){
+    memset(pHash, 0, sizeof(ProllyHash));
+    return SQLITE_OK;
   }
 
   rc = chunkStorePut(ch->pStore, pData, nData, pHash);
@@ -496773,6 +497012,10 @@ static int canonicalRootFromSingleChild(ProllyChunker *ch,
   ProllyHash cur;
   int depth;
   assert( b->level>0 && b->nItems==1 );
+  if( b->level==1 && ch->nLeaf ){
+    int rc = resolveLeaves(ch);
+    if( rc!=SQLITE_OK ) return rc;
+  }
   if( (int)(b->aValOff[1] - b->aValOff[0])!=PROLLY_HASH_SIZE ){
     return SQLITE_CORRUPT;
   }
@@ -496812,7 +497055,7 @@ static int finishPropagateLevel(ProllyChunker *ch, int level){
 
   builderLastKey(&pLevel->builder, &pLastKey, &nLastKey);
   flushedCount = pLevel->subtreeCount;
-  rc = finishFlushLevel(ch, level, &hash);
+  rc = finishFlushLevel(ch, level, 1, &hash);
   if( rc!=SQLITE_OK ) return rc;
 
   rc = addToLevel(ch, level + 1, pLastKey, nLastKey,
@@ -496954,7 +497197,7 @@ int prollyChunkerFinish(ProllyChunker *ch){
           return SQLITE_OK;
         }
 
-        rc = finishFlushLevel(ch, level, &hash);
+        rc = finishFlushLevel(ch, level, 0, &hash);
         if( rc!=SQLITE_OK ) return rc;
 
         memcpy(&ch->root, &hash, sizeof(ProllyHash));
@@ -496993,8 +497236,25 @@ int prollyChunkerAddAtLevelWithCount(ProllyChunker *ch, int level,
   return addToLevel(ch, level, pKey, nKey, pVal, nVal, 0, subtreeCount);
 }
 
+int prollyChunkerAddLeafNode(ProllyChunker *ch,
+                             const u8 *pKey, int nKey,
+                             u8 *pData, int nData, u64 nItems){
+  ProllyHash hash;
+  memset(&hash, 0, sizeof(hash));
+  if( deferLeaf(ch, pData, nData, 0)!=SQLITE_OK ){
+    int rc = chunkStorePut(ch->pStore, pData, nData, &hash);
+    sqlite3_free(pData);
+    if( rc!=SQLITE_OK ) return rc;
+  }
+  return addToLevel(ch, 1, pKey, nKey, hash.data, PROLLY_HASH_SIZE, 0, nItems);
+}
+
 void prollyChunkerFree(ProllyChunker *ch){
   int i;
+  for(i = 0; i < ch->nLeaf; i++) sqlite3_free(ch->aLeaf[i].pData);
+  sqlite3_free(ch->aLeaf);
+  ch->aLeaf = 0;
+  ch->nLeaf = ch->nLeafAlloc = 0;
   for(i = 0; i < ch->nLevels; i++){
     prollyNodeBuilderFree(&ch->aLevel[i].builder);
   }
@@ -497108,7 +497368,7 @@ static SQLITE_INLINE int prollyCheckTree(
 
 static int tryReplaceBatchLeafDirect(
   ProllyMutator*, const ProllyNode*, ProllyMutMapIter*, int,
-  ProllyHash*, int*
+  ProllyHash*, int*, u8**
 );
 
 static int parentChildSubtreeCount(
@@ -497329,9 +497589,15 @@ static int streamingMergeNode(
         rc = SQLITE_NOTFOUND;
         if( prollyChunkerLevelsBelowEmpty(pChunker, 1) ){
           int changed = 0;
+          u8 *pLeafData = 0;
           rc = tryReplaceBatchLeafDirect(pMut, &pChildEntry->node, pIter,
-                                         childIsLast, &childHash, &changed);
-          if( rc==SQLITE_OK ){
+                                         childIsLast, &childHash, &changed,
+                                         &pLeafData);
+          if( rc==SQLITE_OK && pLeafData ){
+            rc = prollyChunkerAddLeafNode(pChunker, pBoundKey, nBoundKey,
+                      pLeafData, pChildEntry->node.nData,
+                      pChildEntry->node.nItems);
+          }else if( rc==SQLITE_OK ){
             rc = prollyChunkerAddAtLevelWithCount(pChunker, 1,
                       pBoundKey, nBoundKey, childHash.data, PROLLY_HASH_SIZE,
                       pChildEntry->node.nItems);
@@ -498273,7 +498539,8 @@ static int tryReplaceBatchLeafDirect(
   ProllyMutMapIter *pIter,
   int isLast,
   ProllyHash *pHash,
-  int *pChanged
+  int *pChanged,
+  u8 **ppData
 ){
   ProllyMutMapIter iter = *pIter;
   u8 *pData = 0;
@@ -498352,9 +498619,13 @@ static int tryReplaceBatchLeafDirect(
     if( nCopied<pLeaf->nData ){
       memcpy(pData+nCopied, pLeaf->pData+nCopied, pLeaf->nData-nCopied);
     }
-    rc = writeOwnedNode(pMut->pStore, 0, pData, pLeaf->nData, pHash);
+    if( ppData ){
+      *ppData = pData;
+    }else{
+      rc = writeOwnedNode(pMut->pStore, 0, pData, pLeaf->nData, pHash);
+      if( rc!=SQLITE_OK ) return rc;
+    }
     pData = 0;
-    if( rc!=SQLITE_OK ) return rc;
     prollyStatAdd(pStats, nPendingMerge, nChanged);
   }
   sqlite3_free(pData);
@@ -498378,7 +498649,7 @@ static int replaceBatchLeafNoRechunk(
   int i;
 
   rc = tryReplaceBatchLeafDirect(pMut, pLeaf, pIter, isLast,
-                                 pHash, pChanged);
+                                 pHash, pChanged, 0);
   if( rc!=SQLITE_NOTFOUND ) return rc;
 
   prollyNodeBuilderInit(&b, 0, pMut->flags);
@@ -498502,7 +498773,7 @@ static int replaceBatchNodeNoRechunk(
       if( pChildEntry && pChildEntry->node.nValuePrefix ){
         rc = tryReplaceBatchLeafDirect(pMut, &pChildEntry->node, pIter,
                                        childIsLast, &newChildHash,
-                                       &childChanged);
+                                       &childChanged, 0);
         prollyCacheRelease(pMut->pCache, pChildEntry);
         pChildEntry = 0;
       }

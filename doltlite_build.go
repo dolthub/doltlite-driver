@@ -1,4 +1,4 @@
 package doltlite
 
 // BuildVersion identifies the DoltLite source bundled into this module.
-const BuildVersion = "0.51.7"
+const BuildVersion = "0.51.8"

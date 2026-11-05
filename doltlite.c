@@ -197,7 +197,7 @@
 # define DOLTLITE_PROLLY 1
 #endif
 #ifndef DOLTLITE_VERSION
-# define DOLTLITE_VERSION "0.51.8"
+# define DOLTLITE_VERSION "0.51.9"
 #endif
 #ifndef DOLTLITE_ENABLE_REMOTES
 # define DOLTLITE_ENABLE_REMOTES 1
@@ -539231,10 +539231,12 @@ static void doltliteCherryPickFunc(
   int isAbort = 0;
   int allowEmpty = 0;
   int isContinue = 0;
+  int recordOrigin = 0;
   DoltliteCmdOption aOption[] = {
     { "continue", 0, DOLTLITE_CMD_OPTION_FLAG, &isContinue, 0 },
     { "abort", 0, DOLTLITE_CMD_OPTION_FLAG, &isAbort, 0 },
-    { "allow-empty", 0, DOLTLITE_CMD_OPTION_FLAG, &allowEmpty, 0 }
+    { "allow-empty", 0, DOLTLITE_CMD_OPTION_FLAG, &allowEmpty, 0 },
+    { 0, 'x', DOLTLITE_CMD_OPTION_FLAG, &recordOrigin, 0 }
   };
   int nConflicts = 0;
   int dirty = 0;
@@ -539264,7 +539266,7 @@ static void doltliteCherryPickFunc(
     return;
   }
   if( isAbort || isContinue ){
-    if( args.nPositional>0 || allowEmpty ){
+    if( args.nPositional>0 || allowEmpty || recordOrigin ){
       doltliteCmdArgsClear(&args);
       sqlite3_result_error(context, isAbort
           ? "--abort does not take other arguments"
@@ -539334,9 +539336,24 @@ static void doltliteCherryPickFunc(
         &pickCommit.catalogHash, &parentCommit.catalogHash)==0;
     const char *zMsg = pickCommit.zMessage;
     char fallback[256];
+    char *zOrigin = 0;
     if( !zMsg || !*zMsg ){
       sqlite3_snprintf(sizeof(fallback), fallback, "cherry-pick of %s", zRef);
       zMsg = fallback;
+    }
+    if( recordOrigin ){
+      char zPickHex[PROLLY_HASH_SIZE*2+1];
+      doltliteHashToHex(&pickHash, zPickHex);
+      zOrigin = sqlite3_mprintf("%s\n\n(cherry picked from commit %s)",
+                                zMsg, zPickHex);
+      if( !zOrigin ){
+        doltliteCommitClear(&pickCommit);
+        doltliteCommitClear(&parentCommit);
+        doltliteCommitClear(&ourCommit);
+        sqlite3_result_error_nomem(context);
+        return;
+      }
+      zMsg = zOrigin;
     }
 
     rc = applyMergedCatalogAndCommit(db, context,
@@ -539345,6 +539362,7 @@ static void doltliteCherryPickFunc(
         &pickHash,
         &nConflicts, 0,
         &zApplyErr, hexBuf);
+    sqlite3_free(zOrigin);
   }
 
   doltliteCommitClear(&pickCommit);
@@ -539541,13 +539559,20 @@ static int doltliteRevertOne(
   if( rc!=SQLITE_OK ) goto revert_error;
 
   {
-    char msg[512];
+    char *msg;
+    char zRevertHex[PROLLY_HASH_SIZE*2+1];
     /* Commit from HEAD, not the working catalog, so unrelated dirty changes stay uncommitted. */
     const ProllyHash *pCommitOurs =
         prollyHashCompare(&liveOurCatalog, &ourCommit.catalogHash)!=0
           ? &ourCommit.catalogHash : 0;
-    sqlite3_snprintf(sizeof(msg), msg, "Revert \"%s\"",
-                     revertCommit.zMessage ? revertCommit.zMessage : zRef);
+    doltliteHashToHex(pRevert, zRevertHex);
+    msg = sqlite3_mprintf("Revert \"%s\"\n\nThis reverts commit %s.",
+                          revertCommit.zMessage ? revertCommit.zMessage : zRef,
+                          zRevertHex);
+    if( !msg ){
+      rc = SQLITE_NOMEM;
+      goto revert_error;
+    }
 
     rc = applyMergedCatalogAndCommit(db, context,
         &revertCommit.catalogHash, &liveOurCatalog,
@@ -539555,6 +539580,7 @@ static int doltliteRevertOne(
         zAuthorName, zAuthorEmail, 1, 1,
         doltliteCommitParentHash(&revertCommit, 0),
         &nConflicts, 0, &zApplyErr, hexBuf);
+    sqlite3_free(msg);
   }
 
   doltliteCommitClear(&revertCommit);
@@ -540955,7 +540981,7 @@ static int rebaseWritePlanRows(
     "CREATE TABLE main.dolt_rebase("
     "  rebase_order REAL PRIMARY KEY,"
     "  action TEXT,"
-    "  commit_hash TEXT,"
+    "  commit_hash TEXT NOT NULL CHECK(dolt_rebase_commit_check(commit_hash)),"
     "  commit_message TEXT NOT NULL"
     ")");
   if( rc!=SQLITE_OK ) return rc;
@@ -541023,7 +541049,7 @@ static int rebaseCreateAndPopulatePlanTable(
     "CREATE TABLE main.dolt_rebase("
     "  rebase_order REAL PRIMARY KEY,"
     "  action TEXT,"
-    "  commit_hash TEXT,"
+    "  commit_hash TEXT NOT NULL CHECK(dolt_rebase_commit_check(commit_hash)),"
     "  commit_message TEXT NOT NULL"
     ")");
   if( rc!=SQLITE_OK ) return rc;
@@ -543373,7 +543399,60 @@ rebase_cleanup:
 }
 
 
+/* Plan edits must name an existing commit at write time, as in Dolt, so a
+** bad hash is refused before --continue rather than during it. */
+static void doltliteRebaseCommitCheckFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  sqlite3 *db = sqlite3_context_db_handle(context);
+  const char *zHex;
+  ProllyHash h;
+  DoltliteCommit commit;
+  char *zMsg;
+  int rc;
+
+  (void)argc;
+  if( sqlite3_value_type(argv[0])==SQLITE_NULL ){
+    sqlite3_result_int(context, 1);
+    return;
+  }
+  zHex = (const char*)sqlite3_value_text(argv[0]);
+  if( !zHex ){
+    sqlite3_result_error_nomem(context);
+    return;
+  }
+  if( strlen(zHex)!=PROLLY_HASH_SIZE*2 || doltliteHexToHash(zHex, &h)!=SQLITE_OK ){
+    zMsg = sqlite3_mprintf("invalid commit hash: %s", zHex);
+  }else{
+    memset(&commit, 0, sizeof(commit));
+    rc = doltliteLoadCommit(db, &h, &commit);
+    doltliteCommitClear(&commit);
+    if( rc==SQLITE_OK ){
+      sqlite3_result_int(context, 1);
+      return;
+    }
+    if( rc!=SQLITE_NOTFOUND && rc!=SQLITE_CORRUPT ){
+      sqlite3_result_error_code(context, rc);
+      return;
+    }
+    zMsg = sqlite3_mprintf(
+        "unable to resolve commit hash %s: target commit not found", zHex);
+  }
+  if( !zMsg ){
+    sqlite3_result_error_nomem(context);
+    return;
+  }
+  sqlite3_result_error(context, zMsg, -1);
+  sqlite3_free(zMsg);
+}
+
 int doltliteRebaseRegister(sqlite3 *db){
+  int rc = sqlite3_create_function(db, "dolt_rebase_commit_check", 1,
+      SQLITE_UTF8|SQLITE_DETERMINISTIC|SQLITE_INNOCUOUS, 0,
+      doltliteRebaseCommitCheckFunc, 0, 0);
+  if( rc!=SQLITE_OK ) return rc;
   return doltliteCreateCommandFunc(db, "dolt_rebase", -1,
                                  doltliteRebaseFunc);
 }
